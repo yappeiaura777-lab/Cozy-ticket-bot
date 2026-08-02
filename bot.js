@@ -1,10 +1,14 @@
+// Standalone Discord.js Exchange Bot (Cozy Exchange Panel & Ticket System)
+// Ready for 24/7 hosting on Render, Replit, Railway, Discloud, or VPS.
+
+try { require('dotenv').config(); } catch (e) {}
+
 const { 
   Client, 
   GatewayIntentBits, 
   EmbedBuilder, 
   ActionRowBuilder, 
   StringSelectMenuBuilder, 
-  ChannelType, 
   ModalBuilder, 
   TextInputBuilder, 
   TextInputStyle, 
@@ -32,6 +36,7 @@ const client = new Client({
   ]
 });
 
+// Roles & Config Constants
 const EXCHANGER_ROLE_ID = '1532005989879124129';
 
 // Helper to reliably check if a member has the required staff role (<@&1532005989879124129>) or admin perms
@@ -94,76 +99,75 @@ async function isStaffMember(memberOrUser, guild) {
 const TRANSCRIPT_CHANNEL_ID = '1531286414757593178';
 const HISTORY_CHANNEL_ID = '1531286413289656411';
 const RULES_CHANNEL_ID = '1531286418025091171';
-const CATEGORY_ID = '1531286420550062130';
-const LOG_CHANNEL_ID = '1531286413289656411';
+const FEEDBACK_CHANNEL_ID = '1532423288058417182';
 
-// Dynamic deal ID counter
-let dealCounter = 5860;
+// In-Memory Storage
+const ticketDataMap = new Map();
+const tempExchangeMap = new Map();
 
-client.once('ready', () => {
-  console.log(`[BOT IS ONLINE] Logged in as ${client.user.tag}`);
-  
-  // Set custom streaming activity
+// Default Exchange Rates Configuration
+const rates = {
+  inrToCrypto: 104,
+  cryptoToInrBelow100: 100,
+  cryptoToInrAbove100: 101,
+  cryptoToCryptoFeePercent: 1.5,
+  minAmountDollars: 1,
+  categoryIds: {
+    i2c: '1531286400882966589',
+    c2i: '1531286401889599612',
+    c2c: '1531286403734835381'
+  }
+};
+
+// Helper: Check if a channel is a valid exchange ticket channel
+function isTicketChannel(channel) {
+  if (!channel || !channel.name) return false;
+
+  // 1. Check in ticketDataMap
+  if (ticketDataMap.has(channel.id)) return true;
+  for (const [id, t] of ticketDataMap.entries()) {
+    if (t.channelId === channel.id || (id && channel.name.includes(id))) {
+      return true;
+    }
+  }
+
+  // 2. Check if parent category matches exchange categories
+  if (channel.parentId && Object.values(rates.categoryIds).includes(channel.parentId)) {
+    return true;
+  }
+
+  // 3. Check channel name pattern
+  const name = channel.name.toLowerCase();
+  if (/^(i2c|c2i|c2c|ticket|deal|claimed|unclaimed|claim|done)-/.test(name)) {
+    return true;
+  }
+
+  return false;
+}
+
+// Helper: Get ticket data safely from channel
+function getTicketData(channel) {
+  if (!channel) return null;
+  if (ticketDataMap.has(channel.id)) return ticketDataMap.get(channel.id);
+  const name = channel.name || '';
+  for (const [id, t] of ticketDataMap.entries()) {
+    if (t.channelId === channel.id || (id && name.includes(id))) {
+      return t;
+    }
+  }
+  return null;
+}
+
+client.on('ready', () => {
+  console.log(`[Cozy Bot] Logged in as ${client.user.tag}!`);
   client.user.setPresence({
-    activities: [{
-      name: 'Exchanging & Tickets',
-      type: ActivityType.Streaming,
-      url: 'https://www.twitch.tv/discord'
-    }],
-    status: 'dnd'
+    activities: [{ name: 'Cozy Exchange Panel', type: ActivityType.Watching }],
+    status: 'online'
   });
 });
 
-// Helper function to build ticket panel message components
-function buildTicketPanel() {
-  const panelEmbed = new EmbedBuilder()
-    .setTitle('<a:rizz_pinksparkles:1531330172421406720> Cozy Exchange Service')
-    .setDescription(
-      `Welcome to **Cozy Exchange**!\n\n` +
-      `Choose a exchange type from the dropdown menu below to open a ticket.\n\n` +
-      `<a:rizz_tick:1531330187160064030> **In-Game to Crypto (I2C)**\n` +
-      ` Exchange in-game items/currency for Crypto.\n\n` +
-      `<a:rizz_tick:1531330187160064030> **Crypto to In-Game (C2I)**\n` +
-      ` Exchange Crypto for in-game items/currency.\n\n` +
-      `<a:rizz_tick:1531330187160064030> **Crypto to Crypto (C2C)**\n` +
-      ` Exchange one Cryptocurrency for another.\n\n` +
-      `🔒 *All exchanges are secured by our staff.*`
-    )
-    .setColor(0x2b2d31)
-    .setImage('https://media.discordapp.net/attachments/1210884639943491635/1210884826883489812/Cozy_Exchange.png')
-    .setFooter({ text: 'Cozy Exchange • Secure & Fast Service' });
-
-  const selectMenu = new StringSelectMenuBuilder()
-    .setCustomId('ticket_type_select')
-    .setPlaceholder('Select Exchange Type...')
-    .addOptions([
-      {
-        label: 'In-Game to Crypto (I2C)',
-        description: 'Exchange in-game items/currency for Crypto',
-        value: 'i2c',
-        emoji: '🎮'
-      },
-      {
-        label: 'Crypto to In-Game (C2I)',
-        description: 'Exchange Crypto for in-game items/currency',
-        value: 'c2i',
-        emoji: '💸'
-      },
-      {
-        label: 'Crypto to Crypto (C2C)',
-        description: 'Exchange one Cryptocurrency for another',
-        value: 'c2c',
-        emoji: '🔄'
-      }
-    ]);
-
-  const row = new ActionRowBuilder().addComponents(selectMenu);
-  return { embeds: [panelEmbed], components: [row] };
-}
-
-// Handle text commands
 client.on('messageCreate', async (message) => {
-  if (message.author.bot || !message.guild) return;
+  if (message.author.bot) return;
 
   const content = message.content.trim();
   const lowerContent = content.toLowerCase();
@@ -175,25 +179,76 @@ client.on('messageCreate', async (message) => {
     if (!isStaff) {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
-        .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this command!**`);
-      return message.reply({ embeds: [errEmbed] });
+        .setDescription(`❌ **Only staff members with <@&${EXCHANGER_ROLE_ID}> role can run the panel setup command!**`);
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
     }
 
-    const panelData = buildTicketPanel();
-    await message.channel.send(panelData);
-    if (message.deletable) await message.delete().catch(() => {});
+    const embed = new EmbedBuilder()
+      .setColor(0x0099ff)
+      .setDescription(
+        `# Cozy Exchange Panel\n\n` +
+        `Exchange Rates : <a:paisafire:1531292252498956513>\n\n` +
+        `<:paisa:1531292193829028042> **INR TO CRYPTO (I2C)**\n` +
+        `<a:Arroww:1531292687188234441> Any Amount ${rates.inrToCrypto}/$\n\n` +
+        `<:cryptos:1531293118580658286> **CRYPTO TO INR (C2I)**\n` +
+        `<a:Arroww:1531292687188234441> Below 100$ : ${rates.cryptoToInrBelow100}/$\n` +
+        `<a:Arroww:1531292687188234441> Above 100$ : ${rates.cryptoToInrAbove100}/$\n\n` +
+        `<a:c2c_exchs:1531292173230673980> **CRYPTO TO CRYPTO (C2C)**\n` +
+        `<a:Arroww:1531292687188234441> ${rates.cryptoToCryptoFeePercent}% + Transaction Fees\n\n` +
+        `<a:rules_books:1531292929086460034> **RULES**\n` +
+        `<:bluebutton:1531292103882047640> Read Our <#${RULES_CHANNEL_ID}> Before proceeding\n` +
+        `<:bluebutton:1531292103882047640> Fixed Rates No Negotiation\n` +
+        `<:bluebutton:1531292103882047640> Minimum **${rates.minAmountDollars}$**\n` +
+        `<:bluebutton:1531292103882047640> Don't Ping Staff in ticket`
+      )
+      .setFooter({ text: 'Cozy Exch & MM' });
+
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId('select_exchange_type')
+      .setPlaceholder('Select exchange type')
+      .addOptions([
+        { 
+          label: 'In-Game / INR to Crypto (I2C)', 
+          value: 'i2c', 
+          description: 'Exchange in-game items/currency or INR for Crypto',
+          emoji: { id: '1531292193829028042' } 
+        },
+        { 
+          label: 'Crypto to In-Game / INR (C2I)', 
+          value: 'c2i', 
+          description: 'Exchange Crypto for in-game items/currency or INR',
+          emoji: { id: '1531293118580658286' } 
+        },
+        { 
+          label: 'Crypto to Crypto (C2C)', 
+          value: 'c2c', 
+          description: 'Exchange one Cryptocurrency for another',
+          emoji: { id: '1531292173230673980' } 
+        }
+      ]);
+
+    const row = new ActionRowBuilder().addComponents(selectMenu);
+    await message.channel.send({ embeds: [embed], components: [row] });
     return;
   }
 
-  // Command: .done, .dn (Close ticket command)
-  if (['.done', '.dn', '!done', '!dn'].includes(lowerContent)) {
-    if (!message.channel.name.startsWith('ticket-') && 
-        !message.channel.name.startsWith('claimed-') && 
-        !message.channel.name.startsWith('closed-')) {
+  // Command: .vouch, !vouch
+  if (lowerContent.startsWith('.vouch') || lowerContent.startsWith('!vouch')) {
+    if (!isTicketChannel(message.channel)) {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
-        .setDescription('❌ **This command can only be used inside a ticket channel!**');
-      return message.reply({ embeds: [errEmbed] });
+        .setDescription('❌ **This command can only be used inside an active ticket channel!**');
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
     }
 
     const isStaff = await isStaffMember(message.member || message.author, message.guild);
@@ -202,33 +257,73 @@ client.on('messageCreate', async (message) => {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
         .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this command!**`);
-      return message.reply({ embeds: [errEmbed] });
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
     }
 
-    const closeEmbed = new EmbedBuilder()
-      .setColor(0xff0000)
-      .setTitle('🔒 Ticket Closing')
-      .setDescription(`Ticket closed by ${message.author}. Channel will be deleted in 5 seconds...`);
+    const data = getTicketData(message.channel);
+    const ticketOwner = data?.user ? `<@${data.user.id}>` : `<@${message.author.id}>`;
+    const exchangerUser = data?.claimedUser ? `<@${data.claimedUser.id}>` : '@staff';
+    const typeStr = data?.type === 'c2i' ? 'CRYPTO TO INR' : data?.type === 'c2c' ? 'CRYPTO TO CRYPTO' : 'INR TO CRYPTO';
 
-    await message.channel.send({ embeds: [closeEmbed] });
-
-    setTimeout(async () => {
-      try {
-        await message.channel.delete();
-      } catch (e) {
-        console.error('Error deleting channel:', e);
+    let usdVal = 1.00;
+    if (data?.modalData?.dealAmount) {
+      const amtStr = String(data.modalData.dealAmount);
+      const raw = parseFloat(amtStr.replace(/[^0-9.]/g, ''));
+      if (!isNaN(raw) && raw > 0) {
+        if (data.type === 'i2c') {
+          usdVal = amtStr.includes('$') ? raw : (raw / 104);
+        } else {
+          usdVal = raw;
+        }
       }
-    }, 5000);
+    }
+    const amountUsdStr = `${usdVal.toFixed(2)}$`;
+    const copyableText = `+rep ${exchangerUser} EXCHANGED ${typeStr} [${amountUsdStr}]`;
+
+    const vouchEmbed = new EmbedBuilder()
+      .setColor(0x00ff00)
+      .setThumbnail('https://cdn.discordapp.com/attachments/1531294400657887322/1532019340709466293')
+      .setDescription(
+        `<a:green_button:1531292779999662181> **Vouch**\n\n` +
+        `<a:rizz_tick:1531330187160064030> ${ticketOwner} Your deal has been completed successfully!\n\n` +
+        `\`your Vouch ${copyableText}\`\n\n` +
+        `📖 Ticket log & exchange history have been saved!`
+      );
+
+    const copyBtnRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`copy_vouch_${data?.id || 'default'}`)
+        .setLabel('Copy Vouch')
+        .setEmoji('1531292779999662181')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`feedback_btn_${data?.id || 'default'}`)
+        .setLabel('Give Feedback')
+        .setEmoji('⭐')
+        .setStyle(ButtonStyle.Primary)
+    );
+
+    await message.channel.send({ embeds: [vouchEmbed], components: [copyBtnRow] });
     return;
   }
 
-  // Command: .c (Claim command)
+  // Command: .c or !c -> CLAIM TICKET
   if (['.c', '!c'].includes(lowerContent)) {
-    if (!message.channel.name.startsWith('ticket-') && !message.channel.name.startsWith('claimed-')) {
+    if (!isTicketChannel(message.channel)) {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
-        .setDescription('❌ **This command can only be used inside a ticket channel!**');
-      return message.reply({ embeds: [errEmbed] });
+        .setDescription('❌ **This command can only be used inside an active ticket channel!**');
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
     }
 
     const isStaff = await isStaffMember(message.member || message.author, message.guild);
@@ -237,27 +332,49 @@ client.on('messageCreate', async (message) => {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
         .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this command!**`);
-      return message.reply({ embeds: [errEmbed] });
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
     }
 
-    const newChannelName = message.channel.name.replace(/^ticket-/, 'claimed-');
-    await message.channel.setName(newChannelName).catch(() => {});
+    const data = getTicketData(message.channel);
+    if (data) {
+      data.claimedUser = message.author;
+    }
+
+    const authorClean = message.author.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10);
+    const newChanName = `claimed-${authorClean}-${data?.id || Math.floor(1000 + Math.random() * 9000)}`;
+    if (message.channel && 'setName' in message.channel) {
+      message.channel.setName(newChanName).catch(() => {});
+    }
 
     const claimEmbed = new EmbedBuilder()
-      .setColor(0x57f287)
-      .setDescription(`<a:rizz_tick:1531330187160064030> **Ticket Claimed!**\n\nThis ticket is now being handled by ${message.author}.`);
+      .setColor(0x00ff00)
+      .setDescription(
+        `<a:green_button:1531292779999662181> **Ticket Claimed!**\n\n` +
+        `<:Exchangeru:1531340808446542056> **Claimed By:** <@${message.author.id}>\n` +
+        `<a:Arroww:1531292687188234441> Staff is now reviewing your deal. Please wait for instructions.`
+      );
 
     await message.channel.send({ embeds: [claimEmbed] });
     return;
   }
 
-  // Command: .u (Unclaim command)
+  // Command: .u or !u -> UNCLAIM TICKET
   if (['.u', '!u'].includes(lowerContent)) {
-    if (!message.channel.name.startsWith('claimed-') && !message.channel.name.startsWith('ticket-')) {
+    if (!isTicketChannel(message.channel)) {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
-        .setDescription('❌ **This command can only be used inside a ticket channel!**');
-      return message.reply({ embeds: [errEmbed] });
+        .setDescription('❌ **This command can only be used inside an active ticket channel!**');
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
     }
 
     const isStaff = await isStaffMember(message.member || message.author, message.guild);
@@ -266,293 +383,765 @@ client.on('messageCreate', async (message) => {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
         .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this command!**`);
-      return message.reply({ embeds: [errEmbed] });
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
     }
 
-    const newChannelName = message.channel.name.replace(/^claimed-/, 'ticket-');
-    await message.channel.setName(newChannelName).catch(() => {});
+    const data = getTicketData(message.channel);
+    if (data) {
+      data.claimedUser = null;
+    }
+
+    const newChanName = `unclaimed-${data?.id || Math.floor(1000 + Math.random() * 9000)}`;
+    if (message.channel && 'setName' in message.channel) {
+      message.channel.setName(newChanName).catch(() => {});
+    }
 
     const unclaimEmbed = new EmbedBuilder()
-      .setColor(0xfee75c)
-      .setDescription(`🟡 **Ticket Unclaimed!**\n\n${message.author} has unclaimed this ticket. It is now open for other staff.`);
+      .setColor(0xffa500)
+      .setDescription(
+        `<a:red_button:1531292779999662181> **Ticket Unclaimed**\n\n` +
+        `<:Exchangeru:1531340808446542056> Ticket has been unclaimed by <@${message.author.id}>.\n` +
+        `<a:Arroww:1531292687188234441> The ticket is now available for other staff members to claim.`
+      );
 
     await message.channel.send({ embeds: [unclaimEmbed] });
     return;
   }
 
-  // Public Ticket Commands: .i2c, .c2i, .c2c
-  if (['.i2c', '!i2c', '.c2i', '!c2i', '.c2c', '!c2c'].includes(lowerContent)) {
-    const type = lowerContent.replace(/^[.!]/, '');
-    const modal = new ModalBuilder()
-      .setCustomId(`ticket_modal_${type}`)
-      .setTitle(`Create ${type.toUpperCase()} Ticket`);
+  // Command: .dn, .done, !dn, !done -> MARK TICKET DONE
+  if (['.dn', '!dn', '.done', '!done'].includes(lowerContent)) {
+    if (!isTicketChannel(message.channel)) {
+      const errEmbed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setDescription('❌ **This command can only be used inside an active ticket channel!**');
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
+    }
 
-    const sendMethodInput = new TextInputBuilder()
-      .setCustomId('sending_method')
-      .setLabel('Sending Method')
-      .setPlaceholder('e.g. PayPal, Crypto, Robux, CashApp')
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true);
+    const isStaff = await isStaffMember(message.member || message.author, message.guild);
 
-    const recvCryptoInput = new TextInputBuilder()
-      .setCustomId('receiving_crypto')
-      .setLabel('Receiving Crypto / Method')
-      .setPlaceholder('e.g. USDT, LTC, BTC')
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true);
+    if (!isStaff) {
+      const errEmbed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this command!**`);
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
+    }
 
-    const dealAmountInput = new TextInputBuilder()
-      .setCustomId('deal_amount')
-      .setLabel('Deal Amount ($ or Currency)')
-      .setPlaceholder('e.g. $50 or 50 USDT')
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true);
+    const doneEmbed = new EmbedBuilder()
+      .setColor(0x00ff00)
+      .setDescription(
+        `<a:rizz_tick:1531330187160064030> **Ticket Completed / Done!**\n\n` +
+        `<a:green_button:1531292779999662181> Deal marked as completed by <@${message.author.id}>.\n\n` +
+        `<a:Arroww:1531292687188234441> Type \`.vouch\` to generate vouch message & review buttons, or \`.close\` to close and archive this ticket.`
+      );
 
-    const row1 = new ActionRowBuilder().addComponents(sendMethodInput);
-    const row2 = new ActionRowBuilder().addComponents(recvCryptoInput);
-    const row3 = new ActionRowBuilder().addComponents(dealAmountInput);
+    await message.channel.send({ embeds: [doneEmbed] });
+    return;
+  }
 
-    modal.addComponents(row1, row2, row3);
-    
-    // Message author reminder
-    return message.reply({ content: `Please use the dropdown menu in the ticket panel or click the interaction to fill details for **${type.toUpperCase()}**!` });
+  // Command: .close, !close -> CLOSE TICKET & SEND TRANSCRIPT/HISTORY
+  if (['.close', '!close'].includes(lowerContent)) {
+    if (!isTicketChannel(message.channel)) {
+      const errEmbed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setDescription('❌ **This command can only be used inside an active ticket channel!**');
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
+    }
+
+    const isStaff = await isStaffMember(message.member || message.author, message.guild);
+
+    if (!isStaff) {
+      const errEmbed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this command!**`);
+      const reply = await message.channel.send({ embeds: [errEmbed] });
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
+    }
+
+    const data = getTicketData(message.channel);
+    const closeEmbed = new EmbedBuilder()
+      .setColor(0x00ff00)
+      .setDescription(
+        `<a:rizz_tick:1531330187160064030> **Closing Ticket...**\n\n` +
+        `<a:green_button:1531292779999662181> Ticket close initiated by <@${message.author.id}>.\n\n` +
+        `<a:Arroww:1531292687188234441> Generating transcript file & sending logs to DM & <#${TRANSCRIPT_CHANNEL_ID}>...\n` +
+        `This channel will auto-delete in 5 seconds.`
+      );
+
+    await message.channel.send({ embeds: [closeEmbed] });
+    await sendTranscript(data?.id || message.channel.id, message.author, message.channel);
+
+    setTimeout(() => {
+      if (message.channel && 'delete' in message.channel) {
+        message.channel.delete().catch(() => {});
+      }
+    }, 5000);
+    return;
   }
 });
 
-// Interaction handler (Select Menu, Modals, Buttons)
+// Interactions Handler (Modals, Dropdowns, Buttons)
 client.on('interactionCreate', async (interaction) => {
-  try {
-    // 1. Dropdown Select Menu
-    if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_type_select') {
-      const selectedType = interaction.values[0]; // 'i2c', 'c2i', 'c2c'
+  if (interaction.isStringSelectMenu() && interaction.customId === 'select_exchange_type') {
+    const selected = interaction.values[0];
 
+    if (selected === 'i2c') {
+      const modal = new ModalBuilder().setCustomId('modal_i2c').setTitle('Initiate I2C (INR/In-Game to Crypto)');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('sendingApp')
+            .setLabel('sending INR app / In-Game item *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. GPay, PhonePe, Paytm, UPI, Game Currency')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('receivingCrypto')
+            .setLabel('receiving crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT TRC20, BTC, TRX')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. 5000 INR or $50')
+            .setRequired(true)
+        )
+      );
+      await interaction.showModal(modal);
+    } else if (selected === 'c2i') {
+      const modal = new ModalBuilder().setCustomId('modal_c2i').setTitle('Initiate C2I (Crypto to INR/In-Game)');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('sendingCrypto')
+            .setLabel('sending crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT, BTC, TRX')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('receivingWallet')
+            .setLabel('Receiving Wallet / App Name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. UPI, GPay, Binance, Trust Wallet')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. $50 or 5000 INR')
+            .setRequired(true)
+        )
+      );
+      await interaction.showModal(modal);
+    } else if (selected === 'c2c') {
+      const modal = new ModalBuilder().setCustomId('modal_c2c').setTitle('Initiate C2C (Crypto to Crypto)');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('sendingCrypto')
+            .setLabel('sending crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('receivingCrypto')
+            .setLabel('receiving crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. BTC, TRX, SOL')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. $50')
+            .setRequired(true)
+        )
+      );
+      await interaction.showModal(modal);
+    }
+  } else if (interaction.isModalSubmit()) {
+    if (interaction.customId.startsWith('modal_feedback_')) {
+      const ticketId = interaction.customId.replace('modal_feedback_', '');
+      const ratingRaw = interaction.fields.getTextInputValue('feedback_rating');
+      const feedbackText = interaction.fields.getTextInputValue('feedback_text');
+
+      const data = ticketDataMap.get(ticketId) || getTicketData(interaction.channel);
+      const exchangerUser = data?.claimedUser ? `<@${data.claimedUser.id}>` : '@staff';
+
+      const numRating = parseInt(ratingRaw.trim());
+      let starsStr = ratingRaw;
+      if (!isNaN(numRating) && numRating >= 1 && numRating <= 5) {
+        starsStr = '⭐'.repeat(numRating);
+      }
+
+      const feedbackEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setThumbnail(interaction.user.displayAvatarURL({ extension: 'png', size: 256 }) || 'https://cdn.discordapp.com/attachments/1531294400657887322/1532019340709466293')
+        .setDescription(
+          `🌟 **New Customer Feedback**\n\n` +
+          `<:star_clients:1531293701853417492> **Submitted By:** <@${interaction.user.id}>\n` +
+          `<:Exchangeru:1531340808446542056> **Exchanger:** ${exchangerUser}\n\n` +
+          `⭐ **Rating:** ${starsStr} (${ratingRaw})\n\n` +
+          `💬 **Feedback:**\n> ${feedbackText.replace(/\n/g, '\n> ')}\n\n` +
+          `<a:legiit:1531294113088147637> Cozy Exchange & MM • Verified Review`
+        )
+        .setTimestamp();
+
+      try {
+        const feedbackChan = await client.channels.fetch(FEEDBACK_CHANNEL_ID).catch(() => null);
+        if (feedbackChan && 'send' in feedbackChan) {
+          await feedbackChan.send({ embeds: [feedbackEmbed] }).catch(() => {});
+        }
+      } catch (e) {}
+
+      const serverIcon = interaction.guild?.iconURL({ extension: 'png', size: 256 }) || 'https://cdn.discordapp.com/attachments/1531294400657887322/1532019340709466293';
+      const feedbackDmEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setThumbnail(serverIcon)
+        .setDescription(
+          `<a:rizz_tick:1531330187160064030> **Thank You For Your Feedback!**\n\n` +
+          `<:shineee:1531341185216676122> **Thanks for your feedback!** 😀 👍\n\n` +
+          `Your review has been successfully submitted and posted to <#${FEEDBACK_CHANNEL_ID}>.\n\n` +
+          `📝 **Note from Cozy Exchange Team:**\n` +
+          `> Thank you for choosing Cozy Exchange & MM! We deeply appreciate your trust in our exchange service. If you ever need assistance, feel free to open a ticket anytime!\n\n` +
+          `<a:legiit:1531294113088147637> Cozy Exchange & MM • Trusted & Secure`
+        )
+        .setFooter({ text: 'Cozy Exchange & MM' })
+        .setTimestamp();
+
+      await interaction.user.send({ embeds: [feedbackDmEmbed] }).catch(() => {});
+      await interaction.reply({
+        content: `✅ **Thank you for your feedback!** Your review has been submitted to <#${FEEDBACK_CHANNEL_ID}>.`,
+        ephemeral: true
+      }).catch(() => {});
+      return;
+    }
+
+    const type = interaction.customId.replace('modal_', '');
+    const dealAmount = interaction.fields.getTextInputValue('dealAmount');
+    const sendingApp = type === 'i2c' ? interaction.fields.getTextInputValue('sendingApp') : '';
+    const receivingCrypto = type === 'i2c' || type === 'c2c' ? interaction.fields.getTextInputValue('receivingCrypto') : '';
+    const sendingCrypto = type === 'c2i' || type === 'c2c' ? interaction.fields.getTextInputValue('sendingCrypto') : '';
+    const receivingWallet = type === 'c2i' ? interaction.fields.getTextInputValue('receivingWallet') : '';
+
+    const tempId = `${type}_${Date.now()}`;
+    tempExchangeMap.set(tempId, {
+      user: interaction.user,
+      type,
+      modalData: { dealAmount, isThirdParty: 'No', sendingApp, receivingCrypto, sendingCrypto, receivingWallet }
+    });
+
+    // Step 2: Show Third-Party option selection buttons
+    const tpSelectEmbed = new EmbedBuilder()
+      .setColor(0x0099ff)
+      .setDescription(
+        `<a:rizz_tick:1531330187160064030> **Select Third-Party Payment Option**\n\n` +
+        `Please select whether this exchange involves a Third-Party payment before creating your ticket.\n\n` +
+        `**Exchange Details**\n` +
+        `• **Type:** ${type.toUpperCase()} EXCHANGE\n` +
+        `• **Deal Amount:** ${dealAmount}\n` +
+        `• **Sending Asset / App:** ${sendingApp || sendingCrypto || 'N/A'}\n` +
+        `• **Receiving Asset / Wallet:** ${receivingCrypto || receivingWallet || 'N/A'}\n\n` +
+        `👇 **Click your payment type below:**`
+      );
+
+    const tpNoBtn = new ButtonBuilder()
+      .setCustomId(`tp_select_no_${tempId}`)
+      .setLabel('Third-Party (No)')
+      .setEmoji('🟢')
+      .setStyle(ButtonStyle.Success);
+
+    const tpYesBtn = new ButtonBuilder()
+      .setCustomId(`tp_select_yes_${tempId}`)
+      .setLabel('Third-Party (Yes)')
+      .setEmoji('🔴')
+      .setStyle(ButtonStyle.Danger);
+
+    const tpRow = new ActionRowBuilder().addComponents(tpNoBtn, tpYesBtn);
+
+    await interaction.reply({ embeds: [tpSelectEmbed], components: [tpRow], ephemeral: true });
+  } else if (interaction.isButton()) {
+    if (interaction.customId.startsWith('tp_select_')) {
+      const isYes = interaction.customId.startsWith('tp_select_yes_');
+      const tempId = interaction.customId.replace(isYes ? 'tp_select_yes_' : 'tp_select_no_', '');
+
+      const temp = tempExchangeMap.get(tempId);
+      if (!temp) {
+        await interaction.reply({ content: 'Session expired. Please try again.', ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      temp.modalData.isThirdParty = isYes ? 'Yes (Third Party Payment)' : 'No (Self Payment)';
+
+      const confirmEmbed = new EmbedBuilder()
+        .setColor(0x0099ff)
+        .setDescription(
+          `<a:rizz_tick:1531330187160064030> **Confirm Your Exchange**\n\n` +
+          `Review all the ticket details before your exchange ticket is created.\n\n` +
+          `**Exchange Overview**\n` +
+          `• **Type:** ${temp.type.toUpperCase()} EXCHANGE\n` +
+          `• **Deal Amount:** ${temp.modalData.dealAmount}\n\n` +
+          `**Ticket Details**\n` +
+          `• **Sending Asset / App:** ${temp.modalData.sendingApp || temp.modalData.sendingCrypto || 'Provided in Ticket'}\n` +
+          `• **Receiving Asset / Wallet:** ${temp.modalData.receivingCrypto || temp.modalData.receivingWallet || 'Provided in Ticket'}\n` +
+          `• **Third Party Payment:** ${temp.modalData.isThirdParty}\n\n` +
+          `✨ Cozy Exchange Trusted And Secure.`
+        );
+
+      const confirmBtn = new ButtonBuilder().setCustomId(`confirm_exchange_${tempId}`).setLabel('Confirm Exchange').setStyle(ButtonStyle.Success);
+      const cancelBtn = new ButtonBuilder().setCustomId('cancel_exchange').setLabel('Cancel').setStyle(ButtonStyle.Secondary);
+      const row = new ActionRowBuilder().addComponents(confirmBtn, cancelBtn);
+
+      await interaction.update({ embeds: [confirmEmbed], components: [row] });
+    } else if (interaction.customId === 'cancel_exchange') {
+      try {
+        await interaction.deferUpdate();
+        await interaction.deleteReply();
+      } catch (e) {
+        await interaction.reply({ content: 'Cancelled', ephemeral: true }).catch(() => {});
+      }
+    } else if (interaction.customId.startsWith('confirm_exchange_')) {
+      const tempId = interaction.customId.replace('confirm_exchange_', '');
+      const temp = tempExchangeMap.get(tempId);
+      if (temp) {
+        try {
+          await interaction.deferUpdate();
+          await interaction.deleteReply();
+        } catch (e) {}
+
+        const ticketId = Math.floor(1000 + Math.random() * 9000).toString();
+        const userClean = temp.user.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10);
+        const channelName = `${temp.type}-${userClean}-${ticketId}`;
+        const dealId = `Cozy-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+
+        if (interaction.guild) {
+          const targetCategoryId = rates.categoryIds[temp.type];
+          const channel = await interaction.guild.channels.create({
+            name: channelName,
+            parent: targetCategoryId || null,
+            permissionOverwrites: [
+              { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+              { id: temp.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
+              { id: EXCHANGER_ROLE_ID, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] }
+            ]
+          }).catch(() => null);
+
+          if (channel) {
+            const ticketRecord = {
+              id: ticketId,
+              dealId,
+              user: temp.user,
+              type: temp.type,
+              modalData: temp.modalData,
+              channelId: channel.id
+            };
+            ticketDataMap.set(ticketId, ticketRecord);
+            ticketDataMap.set(channel.id, ticketRecord);
+
+            const ticketEmbed = new EmbedBuilder()
+              .setColor(0x0099ff)
+              .setDescription(
+                `<a:green_button:1531292779999662181> **Cozy Exchange Ticket**\n\n` +
+                `Hello <@${temp.user.id}>\n` +
+                `Read Our <#${RULES_CHANNEL_ID}>\n` +
+                `<@&${EXCHANGER_ROLE_ID}>\n\n` +
+                `<a:rizz_tick:1531330187160064030> **Deal ID:** **${dealId}**\n` +
+                `<:bluee_sup:1531339328561610872> **Client:** <@${temp.user.id}>\n` +
+                `<a:Arroww:1531292687188234441> **Category:** **${temp.type.toUpperCase()} EXCHANGE**\n\n` +
+                `**Payment Details**\n` +
+                `<:paisa:1531292193829028042> **Send:** **${temp.modalData.dealAmount}** via ${temp.modalData.sendingApp || temp.modalData.sendingCrypto || 'App/Wallet'}\n` +
+                `<:cryptos:1531293118580658286> **Receive:** **${temp.modalData.receivingCrypto || temp.modalData.receivingWallet || 'Crypto/Bank'}**\n` +
+                `<:bluebutton:1531292103882047640> **Third Party Payment:** **${temp.modalData.isThirdParty}**`
+              )
+              .setFooter({ text: 'Cozy Exch & MM' });
+
+            const claimBtn = new ButtonBuilder().setCustomId(`ticket_claim_${ticketId}`).setLabel('Claim Ticket').setEmoji('1531294162178277416').setStyle(ButtonStyle.Success);
+            const closeBtn = new ButtonBuilder().setCustomId(`ticket_close_${ticketId}`).setLabel('Close Ticket').setEmoji('1531978320986636293').setStyle(ButtonStyle.Danger);
+            const reqMmBtn = new ButtonBuilder().setCustomId(`ticket_req_mm_${ticketId}`).setLabel('Request Middleman').setEmoji('1531292984132239535').setStyle(ButtonStyle.Primary);
+
+            const row = new ActionRowBuilder().addComponents(claimBtn, closeBtn, reqMmBtn);
+            await channel.send({ content: `<@${temp.user.id}> <@&${EXCHANGER_ROLE_ID}>`, embeds: [ticketEmbed], components: [row] });
+            await interaction.followUp({ content: `Your ticket has been created: <#${channel.id}>`, ephemeral: true }).catch(() => {});
+          }
+        }
+      }
+    } else if (interaction.customId.startsWith('feedback_btn_')) {
+      const ticketId = interaction.customId.replace('feedback_btn_', '');
       const modal = new ModalBuilder()
-        .setCustomId(`ticket_modal_${selectedType}`)
-        .setTitle(`Create ${selectedType.toUpperCase()} Ticket`);
+        .setCustomId(`modal_feedback_${ticketId}`)
+        .setTitle('Cozy Exchange - Feedback');
 
-      const sendMethodInput = new TextInputBuilder()
-        .setCustomId('sending_method')
-        .setLabel('Sending Method')
-        .setPlaceholder('e.g. Payment / PayPal / GiftCard')
+      const ratingInput = new TextInputBuilder()
+        .setCustomId('feedback_rating')
+        .setLabel('Rating (1 to 5 Stars)')
         .setStyle(TextInputStyle.Short)
+        .setPlaceholder('5')
         .setRequired(true);
 
-      const recvCryptoInput = new TextInputBuilder()
-        .setCustomId('receiving_crypto')
-        .setLabel('Receiving Crypto')
-        .setPlaceholder('e.g. Usdt / LTC / BTC')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true);
-
-      const dealAmountInput = new TextInputBuilder()
-        .setCustomId('deal_amount')
-        .setLabel('Deal Amount')
-        .setPlaceholder('e.g. 10')
-        .setStyle(TextInputStyle.Short)
+      const feedbackInput = new TextInputBuilder()
+        .setCustomId('feedback_text')
+        .setLabel('Your Review / Feedback')
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder('Eg. Fast and smooth exchange!')
         .setRequired(true);
 
       modal.addComponents(
-        new ActionRowBuilder().addComponents(sendMethodInput),
-        new ActionRowBuilder().addComponents(recvCryptoInput),
-        new ActionRowBuilder().addComponents(dealAmountInput)
+        new ActionRowBuilder().addComponents(ratingInput),
+        new ActionRowBuilder().addComponents(feedbackInput)
       );
 
       await interaction.showModal(modal);
-    }
+    } else if (interaction.customId.startsWith('copy_vouch_')) {
+      const ticketId = interaction.customId.replace('copy_vouch_', '');
+      const data = ticketDataMap.get(ticketId) || getTicketData(interaction.channel);
+      const exchangerUser = data?.claimedUser ? `<@${data.claimedUser.id}>` : '@staff';
+      const typeStr = data?.type === 'c2i' ? 'CRYPTO TO INR' : data?.type === 'c2c' ? 'CRYPTO TO CRYPTO' : 'INR TO CRYPTO';
 
-    // 2. Modal Submission -> Create Ticket Channel
-    else if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket_modal_')) {
-      const ticketType = interaction.customId.replace('ticket_modal_', '').toUpperCase();
-      const sendingMethod = interaction.fields.getTextInputValue('sending_method');
-      const receivingCrypto = interaction.fields.getTextInputValue('receiving_crypto');
-      const dealAmount = interaction.fields.getTextInputValue('deal_amount');
-
-      await interaction.deferReply({ ephemeral: true });
-
-      dealCounter++;
-      const currentDealId = dealCounter;
-      const cleanUsername = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const channelName = `ticket-${cleanUsername}-${currentDealId}`;
-
-      const guild = interaction.guild;
-      if (!guild) return;
-
-      // Create ticket channel
-      const ticketChannel = await guild.channels.create({
-        name: channelName,
-        type: ChannelType.GuildText,
-        parent: CATEGORY_ID || null,
-        permissionOverwrites: [
-          {
-            id: guild.id, // @everyone
-            deny: [PermissionFlagsBits.ViewChannel]
-          },
-          {
-            id: interaction.user.id, // Ticket opener
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-              PermissionFlagsBits.AttachFiles
-            ]
-          },
-          {
-            id: EXCHANGER_ROLE_ID, // Staff role
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-              PermissionFlagsBits.AttachFiles
-            ]
-          }
-        ]
+      let usdVal = 1.00;
+      if (data?.modalData?.dealAmount) {
+        const amtStr = String(data.modalData.dealAmount);
+        const raw = parseFloat(amtStr.replace(/[^0-9.]/g, ''));
+        if (!isNaN(raw) && raw > 0) {
+          usdVal = data.type === 'i2c' ? (amtStr.includes('$') ? raw : raw / 104) : raw;
+        }
+      }
+      const copyableText = `+rep ${exchangerUser} EXCHANGED ${typeStr} [${usdVal.toFixed(2)}$]`;
+      await interaction.reply({
+        content: `\`\`\`${copyableText}\`\`\``,
+        ephemeral: true
       });
+    } else if (interaction.customId.startsWith('ticket_req_mm_')) {
+      const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
 
-      // Ticket embed
-      const ticketEmbed = new EmbedBuilder()
-        .setTitle('Welcome to Cozy Exchange Ticket')
-        .setDescription(
-          `Hello ${interaction.user}, thank you for creating a ticket!\n` +
-          `<@&${EXCHANGER_ROLE_ID}> staff will be with you shortly.\n\n` +
-          `**Deal ID:** ${currentDealId}\n` +
-          `**Category:** ${ticketType}\n\n` +
-          `**Deal Information**\n` +
-          `• **Sending Method:** ${sendingMethod}\n` +
-          `• **Receiving Crypto:** ${receivingCrypto}\n` +
-          `• **Deal Amount:** ${dealAmount}`
-        )
-        .setColor(0x2b2d31);
+      if (!isStaff) {
+        const errEmbed = new EmbedBuilder()
+          .setColor(0xff0000)
+          .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this button!**`);
+        await interaction.reply({ embeds: [errEmbed], ephemeral: true });
+        return;
+      }
 
-      // Buttons
-      const claimBtn = new ButtonBuilder()
-        .setCustomId(`ticket_claim_${currentDealId}`)
-        .setLabel('Claim Ticket')
-        .setStyle(ButtonStyle.Success)
-        .setEmoji('🟢');
+      await interaction.reply({
+        content: `<a:rizz_tick:1531330187160064030> **Middleman Requested!** Pinged <@&${EXCHANGER_ROLE_ID}>.`
+      });
+    } else if (interaction.customId.startsWith('ticket_claim_')) {
+      const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
+
+      if (!isStaff) {
+        const errEmbed = new EmbedBuilder()
+          .setColor(0xff0000)
+          .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this button!**`);
+        await interaction.reply({ embeds: [errEmbed], ephemeral: true });
+        return;
+      }
+
+      const ticketId = interaction.customId.replace('ticket_claim_', '');
+      const data = ticketDataMap.get(ticketId) || getTicketData(interaction.channel);
+      if (data) {
+        data.claimedUser = interaction.user;
+      }
+
+      const authorClean = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10);
+      const newChanName = `claimed-${authorClean}-${ticketId}`;
+      if (interaction.channel && 'setName' in interaction.channel) {
+        interaction.channel.setName(newChanName).catch(() => {});
+      }
 
       const unclaimBtn = new ButtonBuilder()
-        .setCustomId(`ticket_unclaim_${currentDealId}`)
+        .setCustomId(`ticket_unclaim_${ticketId}`)
         .setLabel('Unclaim Ticket')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('🟢');
+        .setEmoji('1531292779999662181')
+        .setStyle(ButtonStyle.Secondary);
 
       const closeBtn = new ButtonBuilder()
-        .setCustomId(`ticket_close_${currentDealId}`)
+        .setCustomId(`ticket_close_${ticketId}`)
         .setLabel('Close Ticket')
-        .setStyle(ButtonStyle.Danger)
-        .setEmoji('🚫');
+        .setEmoji('1531978320986636293')
+        .setStyle(ButtonStyle.Danger);
 
-      const mmBtn = new ButtonBuilder()
-        .setCustomId(`ticket_req_mm_${currentDealId}`)
+      const reqMmBtn = new ButtonBuilder()
+        .setCustomId(`ticket_req_mm_${ticketId}`)
         .setLabel('Request Middleman')
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji('👨‍💼');
+        .setEmoji('1531292984132239535')
+        .setStyle(ButtonStyle.Primary);
 
-      const row1 = new ActionRowBuilder().addComponents(unclaimBtn, closeBtn);
-      const row2 = new ActionRowBuilder().addComponents(mmBtn);
+      const updatedRow = new ActionRowBuilder().addComponents(unclaimBtn, closeBtn, reqMmBtn);
 
-      await ticketChannel.send({
-        content: `${interaction.user} <@&${EXCHANGER_ROLE_ID}>`,
-        embeds: [ticketEmbed],
-        components: [row1, row2]
-      });
+      try {
+        await interaction.message.edit({ components: [updatedRow] }).catch(() => {});
+      } catch (e) {}
 
-      await interaction.editReply({
-        content: `<a:rizz_tick:1531330187160064030> Ticket created! Check your channel: ${ticketChannel}`
-      });
-    }
+      const claimEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setDescription(
+          `<a:green_button:1531292779999662181> **Ticket Claimed!**\n\n` +
+          `<:Exchangeru:1531340808446542056> **Claimed By:** <@${interaction.user.id}>\n` +
+          `<a:Arroww:1531292687188234441> Staff is now reviewing your deal. Please wait for instructions.`
+        );
 
-    // 3. Ticket Button Interactions
-    else if (interaction.isButton()) {
-      if (interaction.customId.startsWith('ticket_claim_')) {
-        const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
+      await interaction.reply({ embeds: [claimEmbed] });
+    } else if (interaction.customId.startsWith('ticket_unclaim_')) {
+      const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
 
-        if (!isStaff) {
-          const errEmbed = new EmbedBuilder()
-            .setColor(0xff0000)
-            .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this button!**`);
-          await interaction.reply({ embeds: [errEmbed], ephemeral: true });
-          return;
-        }
-
-        const channel = interaction.channel;
-        const newChannelName = channel.name.replace(/^ticket-/, 'claimed-');
-        await channel.setName(newChannelName).catch(() => {});
-
-        const claimEmbed = new EmbedBuilder()
-          .setColor(0x57f287)
-          .setDescription(`<a:rizz_tick:1531330187160064030> **Ticket Claimed!**\n\nThis ticket is now being handled by ${interaction.user}.`);
-
-        await interaction.reply({ embeds: [claimEmbed] });
-      } else if (interaction.customId.startsWith('ticket_req_mm_')) {
-        const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
-
-        if (!isStaff) {
-          const errEmbed = new EmbedBuilder()
-            .setColor(0xff0000)
-            .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this button!**`);
-          await interaction.reply({ embeds: [errEmbed], ephemeral: true });
-          return;
-        }
-
-        await interaction.reply({
-          content: `<a:rizz_tick:1531330187160064030> **Middleman Requested!** Pinged <@&${EXCHANGER_ROLE_ID}>.`
-        });
-      } else if (interaction.customId.startsWith('ticket_unclaim_')) {
-        const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
-
-        if (!isStaff) {
-          const errEmbed = new EmbedBuilder()
-            .setColor(0xff0000)
-            .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this button!**`);
-          await interaction.reply({ embeds: [errEmbed], ephemeral: true });
-          return;
-        }
-
-        const channel = interaction.channel;
-        const newChannelName = channel.name.replace(/^claimed-/, 'ticket-');
-        await channel.setName(newChannelName).catch(() => {});
-
-        const unclaimEmbed = new EmbedBuilder()
-          .setColor(0xfee75c)
-          .setDescription(`🟡 **Ticket Unclaimed!**\n\n${interaction.user} has unclaimed this ticket. It is now open for other staff.`);
-
-        await interaction.reply({ embeds: [unclaimEmbed] });
-      } else if (interaction.customId.startsWith('ticket_close_')) {
-        const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
-
-        if (!isStaff) {
-          const errEmbed = new EmbedBuilder()
-            .setColor(0xff0000)
-            .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this button!**`);
-          await interaction.reply({ embeds: [errEmbed], ephemeral: true });
-          return;
-        }
-
-        const closeEmbed = new EmbedBuilder()
+      if (!isStaff) {
+        const errEmbed = new EmbedBuilder()
           .setColor(0xff0000)
-          .setTitle('🔒 Ticket Closing')
-          .setDescription(`Ticket closed by ${interaction.user}. Channel will be deleted in 5 seconds...`);
-
-        await interaction.reply({ embeds: [closeEmbed] });
-
-        setTimeout(async () => {
-          try {
-            await interaction.channel.delete();
-          } catch (e) {
-            console.error('Error deleting channel:', e);
-          }
-        }, 5000);
+          .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this button!**`);
+        await interaction.reply({ embeds: [errEmbed], ephemeral: true });
+        return;
       }
-    }
-  } catch (error) {
-    console.error('Interaction handler error:', error);
-    if (interaction.deferred || interaction.replied) {
-      await interaction.followUp({ content: 'There was an error while executing this command!', ephemeral: true }).catch(() => {});
-    } else {
-      await interaction.reply({ content: 'There was an error while executing this command!', ephemeral: true }).catch(() => {});
+
+      const ticketId = interaction.customId.replace('ticket_unclaim_', '');
+      const data = ticketDataMap.get(ticketId) || getTicketData(interaction.channel);
+      if (data) {
+        data.claimedUser = null;
+      }
+
+      const newChanName = `unclaimed-${ticketId}`;
+      if (interaction.channel && 'setName' in interaction.channel) {
+        interaction.channel.setName(newChanName).catch(() => {});
+      }
+
+      const claimBtn = new ButtonBuilder()
+        .setCustomId(`ticket_claim_${ticketId}`)
+        .setLabel('Claim Ticket')
+        .setEmoji('1531294162178277416')
+        .setStyle(ButtonStyle.Success);
+
+      const closeBtn = new ButtonBuilder()
+        .setCustomId(`ticket_close_${ticketId}`)
+        .setLabel('Close Ticket')
+        .setEmoji('1531978320986636293')
+        .setStyle(ButtonStyle.Danger);
+
+      const reqMmBtn = new ButtonBuilder()
+        .setCustomId(`ticket_req_mm_${ticketId}`)
+        .setLabel('Request Middleman')
+        .setEmoji('1531292984132239535')
+        .setStyle(ButtonStyle.Primary);
+
+      const restoredRow = new ActionRowBuilder().addComponents(claimBtn, closeBtn, reqMmBtn);
+
+      try {
+        await interaction.message.edit({ components: [restoredRow] }).catch(() => {});
+      } catch (e) {}
+
+      const unclaimEmbed = new EmbedBuilder()
+        .setColor(0xffa500)
+        .setDescription(
+          `<a:red_button:1531292779999662181> **Ticket Unclaimed**\n\n` +
+          `Ticket has been unclaimed by <@${interaction.user.id}>. The ticket is now available for other staff members to claim.`
+        );
+
+      await interaction.reply({ embeds: [unclaimEmbed] });
+    } else if (interaction.customId.startsWith('ticket_close_')) {
+      const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
+
+      if (!isStaff) {
+        const errEmbed = new EmbedBuilder()
+          .setColor(0xff0000)
+          .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this button!**`);
+        await interaction.reply({ embeds: [errEmbed], ephemeral: true });
+        return;
+      }
+
+      const ticketId = interaction.customId.replace('ticket_close_', '');
+      const closeNoticeEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setDescription(
+          `<a:rizz_tick:1531330187160064030> **Closing Ticket...**\n\n` +
+          `<a:green_button:1531292779999662181> Ticket close initiated by ${interaction.user}.\n` +
+          `<a:Arroww:1531292687188234441> Generating transcript file & sending logs to DM & <#${TRANSCRIPT_CHANNEL_ID}>...\n` +
+          `Channel will delete in 5 seconds.`
+        );
+
+      await interaction.reply({ embeds: [closeNoticeEmbed] });
+      await sendTranscript(ticketId, interaction.user, interaction.channel);
+      setTimeout(() => {
+        if (interaction.channel && 'delete' in interaction.channel) {
+          interaction.channel.delete().catch(() => {});
+        }
+      }, 5000);
     }
   }
+});
+
+// Helper Function: Build Channel Chat Logs
+async function buildChannelTranscript(channelObj, data, actor) {
+  let messages = [];
+  try {
+    if (channelObj && channelObj.messages) {
+      const fetched = await channelObj.messages.fetch({ limit: 100 });
+      messages = Array.from(fetched.values()).reverse();
+    }
+  } catch (e) {}
+
+  const ticketOwnerTag = data?.user ? `${data.user.tag} (${data.user.id})` : 'Unknown User';
+  const claimedStaffTag = data?.claimedUser ? `${data.claimedUser.tag} (${data.claimedUser.id})` : 'Unclaimed / Staff';
+  const dealId = data?.dealId || 'N/A';
+  const typeStr = data?.type ? `${data.type.toUpperCase()} EXCHANGE` : 'EXCHANGE';
+
+  let logLines = [
+    `==================================================`,
+    `        COZY EXCHANGE TICKET TRANSCRIPT           `,
+    `==================================================`,
+    `Deal ID: ${dealId}`,
+    `Client: ${ticketOwnerTag}`,
+    `Claimed Staff: ${claimedStaffTag}`,
+    `Channel: #${channelObj?.name || 'ticket'}`,
+    `Category: ${typeStr}`,
+    `Closed By: ${actor ? `${actor.tag} (${actor.id})` : 'System/Command'}`,
+    `Date & Time: ${new Date().toLocaleString()}`,
+    `==================================================\n`,
+    `--- CHAT LOGS ---`
+  ];
+
+  for (const m of messages) {
+    const timeStr = m.createdAt ? m.createdAt.toLocaleTimeString() : '';
+    const authorStr = `${m.author.tag}`;
+    const textContent = m.content ? m.content : (m.embeds?.length ? '[Embed Message]' : '');
+    logLines.push(`[${timeStr}] ${authorStr}: ${textContent}`);
+    if (m.attachments?.size > 0) {
+      m.attachments.forEach(att => {
+        logLines.push(`    [Attachment]: ${att.url}`);
+      });
+    }
+  }
+
+  logLines.push(`\n==================================================`);
+  logLines.push(`          END OF TRANSCRIPT                       `);
+  logLines.push(`==================================================`);
+
+  return logLines.join('\n');
+}
+
+// Helper Function: Send Transcript, DM & History
+async function sendTranscript(ticketId, actor, channelObj) {
+  const data = ticketDataMap.get(ticketId) || getTicketData(channelObj);
+  const ticketOwner = data?.user ? `<@${data.user.id}>` : (actor ? `<@${actor.id}>` : 'User');
+  const exchangerUser = data?.claimedUser ? `<@${data.claimedUser.id}>` : '@staff';
+  const dealId = data?.dealId || 'N/A';
+  const typeStr = data?.type ? `${data.type.toUpperCase()} EXCHANGE` : 'EXCHANGE';
+  const dealAmount = data?.modalData?.dealAmount || 'N/A';
+
+  const transcriptText = await buildChannelTranscript(channelObj, data, actor);
+  const fileName = `transcript-${channelObj?.name || 'ticket'}.txt`;
+  const attachment = new AttachmentBuilder(Buffer.from(transcriptText, 'utf-8'), { name: fileName });
+
+  // 1. Send Transcript to TRANSCRIPT_CHANNEL_ID
+  const transcriptEmbed = new EmbedBuilder()
+    .setColor(0x0099ff)
+    .setDescription(
+      `<a:green_button:1531292779999662181> **Cozy Ticket Transcript Saved**\n\n` +
+      `<a:rizz_tick:1531330187160064030> **Deal ID:** \`${dealId}\`\n` +
+      `<:bluee_sup:1531339328561610872> **Client:** ${ticketOwner}\n` +
+      `<:Exchangeru:1531340808446542056> **Claimed Staff:** ${exchangerUser}\n` +
+      `<a:Arroww:1531292687188234441> **Category:** **${typeStr}**\n` +
+      `<:paisa:1531292193829028042> **Deal Amount:** **${dealAmount}**\n` +
+      `📁 **Channel:** **#${channelObj?.name || 'ticket'}**\n` +
+      `🕒 **Closed At:** **${new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })}**`
+    )
+    .setFooter({ text: 'Cozy Exchange & MM • Transcript Logs' })
+    .setTimestamp();
+
+  try {
+    const transChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID).catch(() => null);
+    if (transChannel && 'send' in transChannel) {
+      await transChannel.send({ embeds: [transcriptEmbed], files: [attachment] }).catch(() => {});
+    }
+  } catch (e) {}
+
+  // 2. Send DM to Ticket Owner with Transcript Attachment
+  if (data?.user) {
+    const dmAttachment = new AttachmentBuilder(Buffer.from(transcriptText, 'utf-8'), { name: fileName });
+    const dmEmbed = new EmbedBuilder()
+      .setColor(0x00ff00)
+      .setDescription(
+        `<a:rizz_tick:1531330187160064030> **Your Exchange Ticket Has Been Closed**\n\n` +
+        `Hello ${ticketOwner},\n\n` +
+        `Your exchange ticket **#${channelObj?.name || 'ticket'}** has been successfully completed and closed.\n\n` +
+        `<a:green_button:1531292779999662181> **Deal Overview:**\n` +
+        `• **Deal ID:** \`${dealId}\`\n` +
+        `• **Exchanger:** ${exchangerUser}\n` +
+        `• **Category:** ${typeStr}\n` +
+        `• **Amount:** ${dealAmount}\n\n` +
+        `📜 **Full Transcript Attached Below!**\n` +
+        `Thank you for using Cozy Exchange & MM!`
+      )
+      .setFooter({ text: 'Cozy Exchange & MM' })
+      .setTimestamp();
+
+    await data.user.send({ embeds: [dmEmbed], files: [dmAttachment] }).catch(() => {});
+  }
+
+  // 3. Send Exchange Log to HISTORY_CHANNEL_ID
+  const historyEmbed = new EmbedBuilder()
+    .setColor(0x00ff00)
+    .setDescription(
+      `<a:green_button:1531292779999662181> **Exchange Deal Completed**\n\n` +
+      `<a:rizz_tick:1531330187160064030> **Deal ID:** \`${dealId}\`\n` +
+      `<:bluee_sup:1531339328561610872> **Client:** ${ticketOwner}\n` +
+      `<:Exchangeru:1531340808446542056> **Exchanger:** ${exchangerUser}\n` +
+      `<a:Arroww:1531292687188234441> **Category:** **${typeStr}**\n` +
+      `<:paisa:1531292193829028042> **Deal Amount:** **${dealAmount}**\n` +
+      `📖 **Transcript:** Saved to <#${TRANSCRIPT_CHANNEL_ID}>`
+    )
+    .setFooter({ text: 'Cozy Exchange & MM • Exchange History' })
+    .setTimestamp();
+
+  try {
+    const historyChannel = await client.channels.fetch(HISTORY_CHANNEL_ID).catch(() => null);
+    if (historyChannel && 'send' in historyChannel) {
+      await historyChannel.send({ embeds: [historyEmbed] }).catch(() => {});
+    }
+  } catch (e) {}
+}
+
+// Simple HTTP Health Check Server for Render / Railway 24/7 hosting
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Cozy Ticket Bot is running 24/7!');
+}).listen(PORT, '0.0.0.0', () => {
+  console.log(`Keep-alive web server listening on port ${PORT}`);
 });
 
 // Start Discord Bot with Token from Environment Variable
@@ -560,9 +1149,10 @@ let rawToken = process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN || process
 const BOT_TOKEN = rawToken.trim().replace(/^["']|["']$/g, '');
 
 if (!BOT_TOKEN) {
-  console.error('[ERROR] Discord bot token is missing! Please set DISCORD_BOT_TOKEN in your environment variables.');
+  console.error('ERROR: DISCORD_BOT_TOKEN environment variable is not set!');
+  console.log('Set DISCORD_BOT_TOKEN in your host environment variables.');
 } else {
-  client.login(BOT_TOKEN).catch(err => {
-    console.error('[LOGIN ERROR] Failed to log in with provided DISCORD_BOT_TOKEN:', err);
+  client.login(BOT_TOKEN).catch((err) => {
+    console.error('Login error:', err.message);
   });
-          }
+      }
