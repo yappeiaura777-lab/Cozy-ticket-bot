@@ -15,11 +15,11 @@ const {
   ButtonBuilder, 
   ButtonStyle, 
   PermissionFlagsBits, 
+  PermissionsBitField,
   ActivityType, 
   AttachmentBuilder 
 } = require('discord.js');
 
-// Global error handlers to prevent crash on unexpected rejections
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
@@ -42,22 +42,58 @@ const EXCHANGER_ROLE_ID = '1532005989879124129';
 // Helper to reliably check if a member has the required staff role (<@&1532005989879124129>) or admin perms
 async function isStaffMember(memberOrUser, guild) {
   if (!memberOrUser) return false;
-  let member = memberOrUser;
-  
-  // Fetch full GuildMember if given a User or raw object
-  if (guild && (!member.roles || !('cache' in member.roles))) {
-    member = await guild.members.fetch(memberOrUser.id || memberOrUser).catch(() => null);
+
+  // Direct check if memberOrUser object has roles array or cache
+  if (memberOrUser.roles) {
+    if (memberOrUser.roles.cache && typeof memberOrUser.roles.cache.has === 'function') {
+      if (memberOrUser.roles.cache.has(EXCHANGER_ROLE_ID)) return true;
+    } else if (Array.isArray(memberOrUser.roles)) {
+      if (memberOrUser.roles.includes(EXCHANGER_ROLE_ID)) return true;
+    }
   }
-  if (!member || !member.roles) return false;
 
-  const hasRole = member.roles.cache 
-    ? member.roles.cache.has(EXCHANGER_ROLE_ID) 
-    : (Array.isArray(member.roles) ? member.roles.includes(EXCHANGER_ROLE_ID) : false);
-  const isAdmin = member.permissions?.has 
-    ? (member.permissions.has(PermissionFlagsBits.Administrator) || member.permissions.has(PermissionFlagsBits.ManageGuild)) 
-    : false;
+  if (Array.isArray(memberOrUser._roles)) {
+    if (memberOrUser._roles.includes(EXCHANGER_ROLE_ID)) return true;
+  }
 
-  return hasRole || isAdmin;
+  // Permission check
+  if (memberOrUser.permissions) {
+    try {
+      if (typeof memberOrUser.permissions.has === 'function') {
+        if (memberOrUser.permissions.has(PermissionFlagsBits.Administrator) || 
+            memberOrUser.permissions.has(PermissionFlagsBits.ManageGuild)) {
+          return true;
+        }
+      } else if (typeof memberOrUser.permissions === 'string' || typeof memberOrUser.permissions === 'bigint') {
+        const perms = new PermissionsBitField(BigInt(memberOrUser.permissions));
+        if (perms.has(PermissionFlagsBits.Administrator) || perms.has(PermissionFlagsBits.ManageGuild)) {
+          return true;
+        }
+      }
+    } catch (e) {}
+  }
+
+  // Fallback: Fetch full member from guild if available
+  if (guild) {
+    const memberId = memberOrUser.id || (typeof memberOrUser === 'string' ? memberOrUser : null);
+    if (memberId) {
+      try {
+        const fetchedMember = await guild.members.fetch(memberId).catch(() => null);
+        if (fetchedMember && fetchedMember.roles) {
+          if (fetchedMember.roles.cache && fetchedMember.roles.cache.has(EXCHANGER_ROLE_ID)) {
+            return true;
+          }
+          if (fetchedMember.permissions && typeof fetchedMember.permissions.has === 'function' && 
+             (fetchedMember.permissions.has(PermissionFlagsBits.Administrator) || 
+              fetchedMember.permissions.has(PermissionFlagsBits.ManageGuild))) {
+            return true;
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  return false;
 }
 
 const TRANSCRIPT_CHANNEL_ID = '1531286414757593178';
@@ -87,6 +123,7 @@ const rates = {
 function isTicketChannel(channel) {
   if (!channel || !channel.name) return false;
 
+  // 1. Check in ticketDataMap
   if (ticketDataMap.has(channel.id)) return true;
   for (const [id, t] of ticketDataMap.entries()) {
     if (t.channelId === channel.id || (id && channel.name.includes(id))) {
@@ -94,10 +131,12 @@ function isTicketChannel(channel) {
     }
   }
 
+  // 2. Check if parent category matches exchange categories
   if (channel.parentId && Object.values(rates.categoryIds).includes(channel.parentId)) {
     return true;
   }
 
+  // 3. Check channel name pattern
   const name = channel.name.toLowerCase();
   if (/^(i2c|c2i|c2c|ticket|deal|claimed|unclaimed|claim|done)-/.test(name)) {
     return true;
@@ -259,7 +298,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // Command: .c or !c -> CLAIM TICKET
-  if (['.c', '!c'].includes(lowerContent)) {
+  if (['.c', '!c', '.claim', '!claim'].includes(lowerContent)) {
     if (!isTicketChannel(message.channel)) {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
@@ -310,7 +349,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // Command: .u or !u -> UNCLAIM TICKET
-  if (['.u', '!u'].includes(lowerContent)) {
+  if (['.u', '!u', '.unclaim', '!unclaim'].includes(lowerContent)) {
     if (!isTicketChannel(message.channel)) {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
@@ -359,8 +398,8 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Command: .dn, .done, !dn, !done -> MARK TICKET DONE
-  if (['.dn', '!dn', '.done', '!done'].includes(lowerContent)) {
+  // Command: .dn, .done, !dn, !done, .completed, !completed -> MARK TICKET DONE
+  if (['.dn', '!dn', '.done', '!done', '.completed', '!completed'].includes(lowerContent)) {
     if (!isTicketChannel(message.channel)) {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
@@ -458,13 +497,28 @@ client.on('interactionCreate', async (interaction) => {
       const modal = new ModalBuilder().setCustomId('modal_i2c').setTitle('Initiate INR to Crypto Exchange');
       modal.addComponents(
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('send_method').setLabel('Sending Method (e.g. UPI, GPay, Paytm)').setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('sendingApp')
+            .setLabel('sending INR app *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. GPay, PhonePe, Paytm, UPI')
+            .setRequired(true)
         ),
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('rec_crypto').setLabel('Receiving Crypto (e.g. LTC, USDT, TRX)').setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('receivingCrypto')
+            .setLabel('receiving crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT TRC20, BTC, TRX')
+            .setRequired(true)
         ),
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('deal_amount').setLabel(`Deal Amount (Min $${rates.minAmountDollars})`).setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. 5000 INR or $50')
+            .setRequired(true)
         )
       );
       await interaction.showModal(modal);
@@ -472,13 +526,28 @@ client.on('interactionCreate', async (interaction) => {
       const modal = new ModalBuilder().setCustomId('modal_c2i').setTitle('Initiate Crypto to INR Exchange');
       modal.addComponents(
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('send_crypto').setLabel('Sending Crypto (e.g. LTC, USDT)').setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('sendingCrypto')
+            .setLabel('sending crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT, BTC, TRX')
+            .setRequired(true)
         ),
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('rec_inr').setLabel('Receiving INR Method (e.g. UPI, Bank)').setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('receivingWallet')
+            .setLabel('Crypto Wallet Name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. Binance, Trust Wallet, Exodus')
+            .setRequired(true)
         ),
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('deal_amount').setLabel(`Deal Amount (Min $${rates.minAmountDollars})`).setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. $50 or 5000 INR')
+            .setRequired(true)
         )
       );
       await interaction.showModal(modal);
@@ -486,235 +555,267 @@ client.on('interactionCreate', async (interaction) => {
       const modal = new ModalBuilder().setCustomId('modal_c2c').setTitle('Initiate Crypto to Crypto Exchange');
       modal.addComponents(
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('send_crypto').setLabel('Sending Crypto (e.g. BTC, LTC)').setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('sendingCrypto')
+            .setLabel('sending crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT')
+            .setRequired(true)
         ),
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('rec_crypto').setLabel('Receiving Crypto (e.g. USDT)').setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('receivingCrypto')
+            .setLabel('receiving crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. BTC, TRX, SOL')
+            .setRequired(true)
         ),
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('deal_amount').setLabel(`Deal Amount (Min $${rates.minAmountDollars})`).setStyle(TextInputStyle.Short).setRequired(true)
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. $50')
+            .setRequired(true)
         )
       );
       await interaction.showModal(modal);
     }
   } else if (interaction.isModalSubmit()) {
-    if (['modal_i2c', 'modal_c2i', 'modal_c2c'].includes(interaction.customId)) {
-      await interaction.deferReply({ ephemeral: true });
+    if (interaction.customId.startsWith('modal_feedback_')) {
+      const ticketId = interaction.customId.replace('modal_feedback_', '');
+      const ratingRaw = interaction.fields.getTextInputValue('feedback_rating');
+      const feedbackText = interaction.fields.getTextInputValue('feedback_text');
 
-      const dealId = Math.floor(1000 + Math.random() * 9000).toString();
-      const user = interaction.user;
-      let type = 'i2c';
-      let catId = rates.categoryIds.i2c;
-      let modalData = {};
+      const data = ticketDataMap.get(ticketId) || getTicketData(interaction.channel);
+      const exchangerUser = data?.claimedUser ? `<@${data.claimedUser.id}>` : '@staff';
 
-      if (interaction.customId === 'modal_i2c') {
-        type = 'i2c';
-        catId = rates.categoryIds.i2c;
-        modalData = {
-          sendMethod: interaction.fields.getTextInputValue('send_method'),
-          recCrypto: interaction.fields.getTextInputValue('rec_crypto'),
-          dealAmount: interaction.fields.getTextInputValue('deal_amount')
-        };
-      } else if (interaction.customId === 'modal_c2i') {
-        type = 'c2i';
-        catId = rates.categoryIds.c2i;
-        modalData = {
-          sendCrypto: interaction.fields.getTextInputValue('send_crypto'),
-          recInr: interaction.fields.getTextInputValue('rec_inr'),
-          dealAmount: interaction.fields.getTextInputValue('deal_amount')
-        };
-      } else if (interaction.customId === 'modal_c2c') {
-        type = 'c2c';
-        catId = rates.categoryIds.c2c;
-        modalData = {
-          sendCrypto: interaction.fields.getTextInputValue('send_crypto'),
-          recCrypto: interaction.fields.getTextInputValue('rec_crypto'),
-          dealAmount: interaction.fields.getTextInputValue('deal_amount')
-        };
+      const numRating = parseInt(ratingRaw.trim());
+      let starsStr = ratingRaw;
+      if (!isNaN(numRating) && numRating >= 1 && numRating <= 5) {
+        starsStr = '⭐'.repeat(numRating);
       }
 
-      tempExchangeMap.set(interaction.id, { dealId, user, type, catId, modalData });
+      const feedbackEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setThumbnail(interaction.user.displayAvatarURL({ extension: 'png', size: 256 }) || 'https://cdn.discordapp.com/attachments/1531294400657887322/1532019340709466293')
+        .setDescription(
+          `🌟 **New Customer Feedback**\n\n` +
+          `<:star_clients:1531293701853417492> **Submitted By:** <@${interaction.user.id}>\n` +
+          `<:Exchangeru:1531340808446542056> **Exchanger:** ${exchangerUser}\n\n` +
+          `⭐ **Rating:** ${starsStr} (${ratingRaw})\n\n` +
+          `💬 **Feedback:**\n> ${feedbackText.replace(/\n/g, '\n> ')}\n\n` +
+          `<a:legiit:1531294113088147637> Cozy Exchange & MM • Verified Review`
+        )
+        .setTimestamp();
+
+      try {
+        const feedbackChan = await client.channels.fetch(FEEDBACK_CHANNEL_ID).catch(() => null);
+        if (feedbackChan && 'send' in feedbackChan) {
+          await feedbackChan.send({ embeds: [feedbackEmbed] }).catch(() => {});
+        }
+      } catch (e) {}
+
+      const serverIcon = interaction.guild?.iconURL({ extension: 'png', size: 256 }) || 'https://cdn.discordapp.com/attachments/1531294400657887322/1532019340709466293';
+      const feedbackDmEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setThumbnail(serverIcon)
+        .setDescription(
+          `<a:rizz_tick:1531330187160064030> **Thank You For Your Feedback!**\n\n` +
+          `<:shineee:1531341185216676122> **Thanks for your feedback!** 😀 👍\n\n` +
+          `Your review has been successfully submitted and posted to <#${FEEDBACK_CHANNEL_ID}>.\n\n` +
+          `📝 **Note from Cozy Exchange Team:**\n` +
+          `> Thank you for choosing Cozy Exchange & MM! We deeply appreciate your trust in our exchange service. If you ever need assistance, feel free to open a ticket anytime!\n\n` +
+          `<a:legiit:1531294113088147637> Cozy Exchange & MM • Trusted & Secure`
+        )
+        .setFooter({ text: 'Cozy Exchange & MM' })
+        .setTimestamp();
+
+      await interaction.user.send({ embeds: [feedbackDmEmbed] }).catch(() => {});
+      await interaction.reply({
+        content: `✅ **Thank you for your feedback!** Your review has been submitted to <#${FEEDBACK_CHANNEL_ID}>.`,
+        ephemeral: true
+      }).catch(() => {});
+      return;
+    }
+
+    const type = interaction.customId.replace('modal_', '');
+    const dealAmount = interaction.fields.getTextInputValue('dealAmount');
+    const sendingApp = type === 'i2c' ? interaction.fields.getTextInputValue('sendingApp') : '';
+    const receivingCrypto = type === 'i2c' || type === 'c2c' ? interaction.fields.getTextInputValue('receivingCrypto') : '';
+    const sendingCrypto = type === 'c2i' || type === 'c2c' ? interaction.fields.getTextInputValue('sendingCrypto') : '';
+    const receivingWallet = type === 'c2i' ? interaction.fields.getTextInputValue('receivingWallet') : '';
+
+    const tempId = `${type}_${Date.now()}`;
+    tempExchangeMap.set(tempId, {
+      user: interaction.user,
+      type,
+      modalData: { dealAmount, isThirdParty: 'No', sendingApp, receivingCrypto, sendingCrypto, receivingWallet }
+    });
+
+    // Step 2: Show Third-Party option selection buttons
+    const tpSelectEmbed = new EmbedBuilder()
+      .setColor(0x0099ff)
+      .setDescription(
+        `<a:rizz_tick:1531330187160064030> **Select Third-Party Payment Option**\n\n` +
+        `Please select whether this exchange involves a Third-Party payment before creating your ticket.\n\n` +
+        `**Exchange Details**\n` +
+        `• **Type:** ${type.toUpperCase()} EXCHANGE\n` +
+        `• **Deal Amount:** ${dealAmount}\n` +
+        `• **Sending Asset / App:** ${sendingApp || sendingCrypto || 'N/A'}\n` +
+        `• **Receiving Asset / Wallet:** ${receivingCrypto || receivingWallet || 'N/A'}\n\n` +
+        `👇 **Click your payment type below:**`
+      );
+
+    const tpNoBtn = new ButtonBuilder()
+      .setCustomId(`tp_select_no_${tempId}`)
+      .setLabel('Third-Party (No)')
+      .setEmoji('🟢')
+      .setStyle(ButtonStyle.Success);
+
+    const tpYesBtn = new ButtonBuilder()
+      .setCustomId(`tp_select_yes_${tempId}`)
+      .setLabel('Third-Party (Yes)')
+      .setEmoji('🔴')
+      .setStyle(ButtonStyle.Danger);
+
+    const tpRow = new ActionRowBuilder().addComponents(tpNoBtn, tpYesBtn);
+
+    await interaction.reply({ embeds: [tpSelectEmbed], components: [tpRow], ephemeral: true });
+  } else if (interaction.isButton()) {
+    if (interaction.customId.startsWith('tp_select_')) {
+      const isYes = interaction.customId.startsWith('tp_select_yes_');
+      const tempId = interaction.customId.replace(isYes ? 'tp_select_yes_' : 'tp_select_no_', '');
+
+      const temp = tempExchangeMap.get(tempId);
+      if (!temp) {
+        await interaction.reply({ content: 'Session expired. Please try again.', ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      temp.modalData.isThirdParty = isYes ? 'Yes (Third Party Payment)' : 'No (Self Payment)';
 
       const confirmEmbed = new EmbedBuilder()
         .setColor(0x0099ff)
         .setDescription(
-          `# Cozy Exchange Ticket Confirmation\n\n` +
-          `**Deal ID:** \`${dealId}\`\n\n` +
-          `Please confirm your transaction details before creating the ticket:`
+          `<a:rizz_tick:1531330187160064030> **Confirm Your Exchange**\n\n` +
+          `Review all the ticket details before your exchange ticket is created.\n\n` +
+          `**Exchange Overview**\n` +
+          `• **Type:** ${temp.type.toUpperCase()} EXCHANGE\n` +
+          `• **Deal Amount:** ${temp.modalData.dealAmount}\n\n` +
+          `**Ticket Details**\n` +
+          `• **Sending Asset / App:** ${temp.modalData.sendingApp || temp.modalData.sendingCrypto || 'Provided in Ticket'}\n` +
+          `• **Receiving Asset / Wallet:** ${temp.modalData.receivingCrypto || temp.modalData.receivingWallet || 'Provided in Ticket'}\n` +
+          `• **Third Party Payment:** ${temp.modalData.isThirdParty}\n\n` +
+          `✨ Cozy Exchange Trusted And Secure.`
         );
 
-      let fieldsStr = '';
-      if (type === 'i2c') {
-        fieldsStr = `• **Sending Method:** ${modalData.sendMethod}\n• **Receiving Crypto:** ${modalData.recCrypto}\n• **Deal Amount:** ${modalData.dealAmount}`;
-      } else if (type === 'c2i') {
-        fieldsStr = `• **Sending Crypto:** ${modalData.sendCrypto}\n• **Receiving INR:** ${modalData.recInr}\n• **Deal Amount:** ${modalData.dealAmount}`;
-      } else if (type === 'c2c') {
-        fieldsStr = `• **Sending Crypto:** ${modalData.sendCrypto}\n• **Receiving Crypto:** ${modalData.recCrypto}\n• **Deal Amount:** ${modalData.dealAmount}`;
-      }
-
-      confirmEmbed.addFields({ name: 'Details', value: fieldsStr });
-
-      const confirmBtn = new ButtonBuilder()
-        .setCustomId(`confirm_create_ticket_${interaction.id}`)
-        .setLabel('Create Ticket')
-        .setEmoji('1531292779999662181')
-        .setStyle(ButtonStyle.Success);
-
-      const cancelBtn = new ButtonBuilder()
-        .setCustomId(`cancel_ticket_${interaction.id}`)
-        .setLabel('Cancel')
-        .setEmoji('1531292779999662181')
-        .setStyle(ButtonStyle.Danger);
-
+      const confirmBtn = new ButtonBuilder().setCustomId(`confirm_exchange_${tempId}`).setLabel('Confirm Exchange').setStyle(ButtonStyle.Success);
+      const cancelBtn = new ButtonBuilder().setCustomId('cancel_exchange').setLabel('Cancel').setStyle(ButtonStyle.Secondary);
       const row = new ActionRowBuilder().addComponents(confirmBtn, cancelBtn);
-      await interaction.editReply({ embeds: [confirmEmbed], components: [row] });
-    } else if (interaction.customId.startsWith('feedback_modal_')) {
-      const rating = interaction.fields.getTextInputValue('rating_input');
-      const reviewText = interaction.fields.getTextInputValue('review_input');
 
-      await interaction.reply({
-        content: '<a:rizz_tick:1531330187160064030> **Thank you for your feedback!**',
-        ephemeral: true
-      });
-
-      const feedbackEmbed = new EmbedBuilder()
-        .setColor(0x00ff00)
-        .setThumbnail(interaction.user.displayAvatarURL())
-        .setDescription(
-          `<a:green_button:1531292779999662181> **New Client Feedback**\n\n` +
-          `<:bluee_sup:1531339328561610872> **User:** ${interaction.user} (\`${interaction.user.tag}\`)\n` +
-          `⭐ **Rating:** **${rating}**\n` +
-          `💬 **Review:** ${reviewText}\n\n` +
-          `Thank you for trusting Cozy Exchange & MM!`
-        )
-        .setFooter({ text: 'Cozy Exchange & MM • Customer Review' })
-        .setTimestamp();
-
+      await interaction.update({ embeds: [confirmEmbed], components: [row] });
+    } else if (interaction.customId === 'cancel_exchange') {
       try {
-        const fbChannel = await client.channels.fetch(FEEDBACK_CHANNEL_ID).catch(() => null);
-        if (fbChannel && 'send' in fbChannel) {
-          await fbChannel.send({ embeds: [feedbackEmbed] }).catch(() => {});
-        }
-      } catch (e) {}
-    }
-  } else if (interaction.isButton()) {
-    if (interaction.customId.startsWith('confirm_create_ticket_')) {
-      const tempId = interaction.customId.replace('confirm_create_ticket_', '');
-      const data = tempExchangeMap.get(tempId);
-
-      if (!data) {
-        await interaction.reply({ content: '❌ Session expired. Please fill out the form again.', ephemeral: true });
-        return;
+        await interaction.deferUpdate();
+        await interaction.deleteReply();
+      } catch (e) {
+        await interaction.reply({ content: 'Cancelled', ephemeral: true }).catch(() => {});
       }
+    } else if (interaction.customId.startsWith('confirm_exchange_')) {
+      const tempId = interaction.customId.replace('confirm_exchange_', '');
+      const temp = tempExchangeMap.get(tempId);
+      if (temp) {
+        try {
+          await interaction.deferUpdate();
+          await interaction.deleteReply();
+        } catch (e) {}
 
-      await interaction.deferUpdate();
+        const ticketId = Math.floor(1000 + Math.random() * 9000).toString();
+        const userClean = temp.user.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10);
+        const channelName = `${temp.type}-${userClean}-${ticketId}`;
+        const dealId = `Cozy-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
-      const guild = interaction.guild;
-      const typePrefix = data.type;
-      const channelName = `${typePrefix}-${data.user.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10)}-${data.dealId}`;
+        if (interaction.guild) {
+          const targetCategoryId = rates.categoryIds[temp.type];
+          const channel = await interaction.guild.channels.create({
+            name: channelName,
+            parent: targetCategoryId || null,
+            permissionOverwrites: [
+              { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+              { id: temp.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
+              { id: EXCHANGER_ROLE_ID, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] }
+            ]
+          }).catch(() => null);
 
-      try {
-        const ticketChannel = await guild.channels.create({
-          name: channelName,
-          parent: data.catId,
-          permissionOverwrites: [
-            {
-              id: guild.roles.everyone.id,
-              deny: [PermissionFlagsBits.ViewChannel]
-            },
-            {
-              id: data.user.id,
-              allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles]
-            },
-            {
-              id: EXCHANGER_ROLE_ID,
-              allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles]
-            }
-          ]
-        });
+          if (channel) {
+            const ticketRecord = {
+              id: ticketId,
+              dealId,
+              user: temp.user,
+              type: temp.type,
+              modalData: temp.modalData,
+              channelId: channel.id
+            };
+            ticketDataMap.set(ticketId, ticketRecord);
+            ticketDataMap.set(channel.id, ticketRecord);
 
-        ticketDataMap.set(data.dealId, {
-          id: data.dealId,
-          channelId: ticketChannel.id,
-          user: data.user,
-          type: data.type,
-          modalData: data.modalData,
-          claimedUser: null
-        });
+            const ticketEmbed = new EmbedBuilder()
+              .setColor(0x0099ff)
+              .setDescription(
+                `<a:green_button:1531292779999662181> **Cozy Exchange Ticket**\n\n` +
+                `Hello <@${temp.user.id}>\n` +
+                `Read Our <#${RULES_CHANNEL_ID}>\n` +
+                `<@&${EXCHANGER_ROLE_ID}>\n\n` +
+                `<a:rizz_tick:1531330187160064030> **Deal ID:** **${dealId}**\n` +
+                `<:bluee_sup:1531339328561610872> **Client:** <@${temp.user.id}>\n` +
+                `<a:Arroww:1531292687188234441> **Category:** **${temp.type.toUpperCase()} EXCHANGE**\n\n` +
+                `**Payment Details**\n` +
+                `<:paisa:1531292193829028042> **Send:** **${temp.modalData.dealAmount}** via ${temp.modalData.sendingApp || temp.modalData.sendingCrypto || 'App/Wallet'}\n` +
+                `<:cryptos:1531293118580658286> **Receive:** **${temp.modalData.receivingCrypto || temp.modalData.receivingWallet || 'Crypto/Bank'}**\n` +
+                `<:bluebutton:1531292103882047640> **Third Party Payment:** **${temp.modalData.isThirdParty}**`
+              )
+              .setFooter({ text: 'Cozy Exch & MM' });
 
-        ticketDataMap.set(ticketChannel.id, ticketDataMap.get(data.dealId));
+            const claimBtn = new ButtonBuilder().setCustomId(`ticket_claim_${ticketId}`).setLabel('Claim Ticket').setEmoji('1531294162178277416').setStyle(ButtonStyle.Success);
+            const closeBtn = new ButtonBuilder().setCustomId(`ticket_close_${ticketId}`).setLabel('Close Ticket').setEmoji('1531978320986636293').setStyle(ButtonStyle.Danger);
+            const reqMmBtn = new ButtonBuilder().setCustomId(`ticket_req_mm_${ticketId}`).setLabel('Request Middleman').setEmoji('1531292984132239535').setStyle(ButtonStyle.Primary);
 
-        const ticketEmbed = new EmbedBuilder()
-          .setColor(0x0099ff)
-          .setDescription(
-            `# Welcome to Cozy Exchange Ticket\n\n` +
-            `Hello ${data.user}, thank you for creating a ticket!\n` +
-            `<@&${EXCHANGER_ROLE_ID}> staff will be with you shortly.\n\n` +
-            `**Deal ID:** \`${data.dealId}\`\n` +
-            `**Category:** ${data.type.toUpperCase()}`
-          );
-
-        let fieldsStr = '';
-        if (data.type === 'i2c') {
-          fieldsStr = `• **Sending Method:** ${data.modalData.sendMethod}\n• **Receiving Crypto:** ${data.modalData.recCrypto}\n• **Deal Amount:** ${data.modalData.dealAmount}`;
-        } else if (data.type === 'c2i') {
-          fieldsStr = `• **Sending Crypto:** ${data.modalData.sendCrypto}\n• **Receiving INR:** ${data.modalData.recInr}\n• **Deal Amount:** ${data.modalData.dealAmount}`;
-        } else if (data.type === 'c2c') {
-          fieldsStr = `• **Sending Crypto:** ${data.modalData.sendCrypto}\n• **Receiving Crypto:** ${data.modalData.recCrypto}\n• **Deal Amount:** ${data.modalData.dealAmount}`;
+            const row = new ActionRowBuilder().addComponents(claimBtn, closeBtn, reqMmBtn);
+            await channel.send({ content: `<@${temp.user.id}> <@&${EXCHANGER_ROLE_ID}>`, embeds: [ticketEmbed], components: [row] });
+            await interaction.followUp({ content: `Your ticket has been created: <#${channel.id}>`, ephemeral: true }).catch(() => {});
+          }
         }
-
-        ticketEmbed.addFields({ name: 'Deal Information', value: fieldsStr });
-
-        const claimBtn = new ButtonBuilder()
-          .setCustomId(`ticket_claim_${data.dealId}`)
-          .setLabel('Claim Ticket')
-          .setEmoji('1531294162178277416')
-          .setStyle(ButtonStyle.Success);
-
-        const closeBtn = new ButtonBuilder()
-          .setCustomId(`ticket_close_${data.dealId}`)
-          .setLabel('Close Ticket')
-          .setEmoji('1531978320986636293')
-          .setStyle(ButtonStyle.Danger);
-
-        const reqMmBtn = new ButtonBuilder()
-          .setCustomId(`ticket_req_mm_${data.dealId}`)
-          .setLabel('Request Middleman')
-          .setEmoji('1531292984132239535')
-          .setStyle(ButtonStyle.Primary);
-
-        const ticketRow = new ActionRowBuilder().addComponents(claimBtn, closeBtn, reqMmBtn);
-
-        await ticketChannel.send({ content: `<@${data.user.id}> <@&${EXCHANGER_ROLE_ID}>`, embeds: [ticketEmbed], components: [ticketRow] });
-
-        await interaction.editReply({
-          content: `<a:rizz_tick:1531330187160064030> **Ticket Created Successfully!** Check your new channel: ${ticketChannel}`,
-          embeds: [],
-          components: []
-        });
-
-      } catch (err) {
-        console.error('Error creating ticket channel:', err);
-        await interaction.editReply({
-          content: `❌ **Failed to create ticket channel:** ${err.message}`,
-          embeds: [],
-          components: []
-        });
       }
+    } else if (interaction.customId.startsWith('feedback_btn_')) {
+      const ticketId = interaction.customId.replace('feedback_btn_', '');
+      const modal = new ModalBuilder()
+        .setCustomId(`modal_feedback_${ticketId}`)
+        .setTitle('Cozy Exchange - Feedback');
 
-      tempExchangeMap.delete(tempId);
-    } else if (interaction.customId.startsWith('cancel_ticket_')) {
-      const tempId = interaction.customId.replace('cancel_ticket_', '');
-      tempExchangeMap.delete(tempId);
-      await interaction.update({
-        content: '❌ **Ticket creation cancelled.**',
-        embeds: [],
-        components: []
-      });
+      const ratingInput = new TextInputBuilder()
+        .setCustomId('feedback_rating')
+        .setLabel('Rating (1 to 5 Stars)')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('5')
+        .setRequired(true);
+
+      const feedbackInput = new TextInputBuilder()
+        .setCustomId('feedback_text')
+        .setLabel('Your Review / Feedback')
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder('Eg. Fast and smooth exchange!')
+        .setRequired(true);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(ratingInput),
+        new ActionRowBuilder().addComponents(feedbackInput)
+      );
+
+      await interaction.showModal(modal);
     } else if (interaction.customId.startsWith('copy_vouch_')) {
       const ticketId = interaction.customId.replace('copy_vouch_', '');
       const data = ticketDataMap.get(ticketId) || getTicketData(interaction.channel);
-
       const exchangerUser = data?.claimedUser ? `<@${data.claimedUser.id}>` : '@staff';
       const typeStr = data?.type === 'c2i' ? 'CRYPTO TO INR' : data?.type === 'c2c' ? 'CRYPTO TO CRYPTO' : 'INR TO CRYPTO';
 
@@ -723,44 +824,14 @@ client.on('interactionCreate', async (interaction) => {
         const amtStr = String(data.modalData.dealAmount);
         const raw = parseFloat(amtStr.replace(/[^0-9.]/g, ''));
         if (!isNaN(raw) && raw > 0) {
-          if (data.type === 'i2c') {
-            usdVal = amtStr.includes('$') ? raw : (raw / 104);
-          } else {
-            usdVal = raw;
-          }
+          usdVal = data.type === 'i2c' ? (amtStr.includes('$') ? raw : raw / 104) : raw;
         }
       }
       const copyableText = `+rep ${exchangerUser} EXCHANGED ${typeStr} [${usdVal.toFixed(2)}$]`;
-
       await interaction.reply({
-        content: `\`\`\`\n${copyableText}\n\`\`\``,
+        content: `\`\`\`${copyableText}\`\`\``,
         ephemeral: true
       });
-    } else if (interaction.customId.startsWith('feedback_btn_')) {
-      const modal = new ModalBuilder()
-        .setCustomId(`feedback_modal_${interaction.customId.replace('feedback_btn_', '')}`)
-        .setTitle('Give Service Feedback');
-
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('rating_input')
-            .setLabel('Rating (1 to 5 Stars)')
-            .setPlaceholder('e.g. ⭐⭐⭐⭐⭐ (5/5)')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('review_input')
-            .setLabel('Your Review / Feedback')
-            .setPlaceholder('Describe your exchange experience with us...')
-            .setStyle(TextInputStyle.Paragraph)
-            .setRequired(true)
-        )
-      );
-
-      await interaction.showModal(modal);
     } else if (interaction.customId.startsWith('ticket_req_mm_')) {
       const isStaff = await isStaffMember(interaction.member || interaction.user, interaction.guild);
 
@@ -976,107 +1047,87 @@ async function sendTranscript(ticketId, actor, channelObj) {
   const dealAmount = data?.modalData?.dealAmount || 'N/A';
 
   const transcriptText = await buildChannelTranscript(channelObj, data, actor);
-  const fileName = `transcript-${channelObj?.name || 'ticket'}.txt`;
-  const attachment = new AttachmentBuilder(Buffer.from(transcriptText, 'utf-8'), { name: fileName });
+  const buffer = Buffer.from(transcriptText, 'utf-8');
+  const attachment = new AttachmentBuilder(buffer, { name: `transcript-${data?.id || 'ticket'}.txt` });
 
-  // 1. Send Transcript to TRANSCRIPT_CHANNEL_ID
   const transcriptEmbed = new EmbedBuilder()
-    .setColor(0x0099ff)
-    .setDescription(
-      `<a:green_button:1531292779999662181> **Cozy Ticket Transcript Saved**\n\n` +
-      `<a:rizz_tick:1531330187160064030> **Deal ID:** \`${dealId}\`\n` +
-      `<:bluee_sup:1531339328561610872> **Client:** ${ticketOwner}\n` +
-      `<:Exchangeru:1531340808446542056> **Claimed Staff:** ${exchangerUser}\n` +
-      `<a:Arroww:1531292687188234441> **Category:** **${typeStr}**\n` +
-      `<:paisa:1531292193829028042> **Deal Amount:** **${dealAmount}**\n` +
-      `📁 **Channel:** **#${channelObj?.name || 'ticket'}**\n` +
-      `🕒 **Closed At:** **${new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })}**`
-    )
-    .setFooter({ text: 'Cozy Exchange & MM • Transcript Logs' })
-    .setTimestamp();
-
-  try {
-    const transChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID).catch(() => null);
-    if (transChannel && 'send' in transChannel) {
-      await transChannel.send({ embeds: [transcriptEmbed], files: [attachment] }).catch(() => {});
-    }
-  } catch (e) {}
-
-  // 2. Send DM to Ticket Owner with Transcript Attachment
-  if (data?.user) {
-    const dmAttachment = new AttachmentBuilder(Buffer.from(transcriptText, 'utf-8'), { name: fileName });
-    const dmEmbed = new EmbedBuilder()
-      .setColor(0x00ff00)
-      .setDescription(
-        `<a:rizz_tick:1531330187160064030> **Your Exchange Ticket Has Been Closed**\n\n` +
-        `Hello ${ticketOwner},\n\n` +
-        `Your exchange ticket **#${channelObj?.name || 'ticket'}** has been successfully completed and closed.\n\n` +
-        `<a:green_button:1531292779999662181> **Deal Overview:**\n` +
-        `• **Deal ID:** \`${dealId}\`\n` +
-        `• **Exchanger:** ${exchangerUser}\n` +
-        `• **Category:** ${typeStr}\n` +
-        `• **Amount:** ${dealAmount}\n\n` +
-        `📜 **Full Transcript Attached Below!**\n` +
-        `Thank you for using Cozy Exchange & MM!`
-      )
-      .setFooter({ text: 'Cozy Exchange & MM' })
-      .setTimestamp();
-
-    await data.user.send({ embeds: [dmEmbed], files: [dmAttachment] }).catch(() => {});
-  }
-
-  // 3. Send Exchange Log to HISTORY_CHANNEL_ID
-  const historyEmbed = new EmbedBuilder()
     .setColor(0x00ff00)
+    .setTitle('📜 Ticket Transcript & Log')
     .setDescription(
-      `<a:green_button:1531292779999662181> **Exchange Deal Completed**\n\n` +
-      `<a:rizz_tick:1531330187160064030> **Deal ID:** \`${dealId}\`\n` +
-      `<:bluee_sup:1531339328561610872> **Client:** ${ticketOwner}\n` +
-      `<:Exchangeru:1531340808446542056> **Exchanger:** ${exchangerUser}\n` +
-      `<a:Arroww:1531292687188234441> **Category:** **${typeStr}**\n` +
-      `<:paisa:1531292193829028042> **Deal Amount:** **${dealAmount}**\n` +
-      `📖 **Transcript:** Saved to <#${TRANSCRIPT_CHANNEL_ID}>`
+      `**Ticket Details**\n` +
+      `• **Deal ID:** \`${dealId}\`\n` +
+      `• **Category:** ${typeStr}\n` +
+      `• **Client:** ${ticketOwner}\n` +
+      `• **Claimed Staff:** ${exchangerUser}\n` +
+      `• **Closed By:** ${actor ? `<@${actor.id}>` : 'System'}\n` +
+      `• **Date:** ${new Date().toLocaleString()}\n\n` +
+      `📁 *Transcript text file is attached below.*`
     )
-    .setFooter({ text: 'Cozy Exchange & MM • Exchange History' })
     .setTimestamp();
 
+  // Send to Transcript Channel
   try {
-    const historyChannel = await client.channels.fetch(HISTORY_CHANNEL_ID).catch(() => null);
-    if (historyChannel && 'send' in historyChannel) {
-      await historyChannel.send({ embeds: [historyEmbed] }).catch(() => {});
+    const transChan = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID).catch(() => null);
+    if (transChan && 'send' in transChan) {
+      await transChan.send({ embeds: [transcriptEmbed], files: [attachment] }).catch(() => {});
     }
   } catch (e) {}
+
+  // Send to History Channel
+  try {
+    const historyChan = await client.channels.fetch(HISTORY_CHANNEL_ID).catch(() => null);
+    if (historyChan && 'send' in historyChan) {
+      const historyEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setDescription(
+          `<a:green_button:1531292779999662181> **Exchange Completed & Saved**\n\n` +
+          `<a:rizz_tick:1531330187160064030> **Deal ID:** \`${dealId}\`\n` +
+          `<:bluee_sup:1531339328561610872> **Client:** ${ticketOwner}\n` +
+          `<:Exchangeru:1531340808446542056> **Exchanger:** ${exchangerUser}\n` +
+          `<a:Arroww:1531292687188234441> **Type:** ${typeStr}\n` +
+          `💰 **Amount:** ${dealAmount}\n\n` +
+          `✨ Cozy Exchange Trusted & Verified`
+        )
+        .setTimestamp();
+      await historyChan.send({ embeds: [historyEmbed] }).catch(() => {});
+    }
+  } catch (e) {}
+
+  // Send DM to Ticket Creator with Review Button
+  if (data?.user) {
+    try {
+      const reviewEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setTitle('⭐ Thank You For Exchanging With Cozy Exchange!')
+        .setDescription(
+          `Hello <@${data.user.id}>,\n\n` +
+          `Your exchange ticket (\`${dealId}\`) has been closed.\n` +
+          `We hope you enjoyed our fast & secure exchange service!\n\n` +
+          `👇 **Please click below to submit your feedback & rating for our service:**`
+        )
+        .setFooter({ text: 'Cozy Exchange & MM' });
+
+      const reviewRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`feedback_btn_${data.id}`)
+          .setLabel('Leave a Review')
+          .setEmoji('⭐')
+          .setStyle(ButtonStyle.Success)
+      );
+
+      await data.user.send({ embeds: [reviewEmbed], components: [reviewRow], files: [attachment] }).catch(() => {});
+    } catch (e) {}
+  }
 }
 
-// Simple HTTP Health Check Server for Render / Railway 24/7 hosting
-const http = require('http');
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Cozy Ticket Bot is running 24/7!');
-}).listen(PORT, '0.0.0.0', () => {
-  console.log(`Keep-alive web server listening on port ${PORT}`);
-});
+// Bot Startup Token Handler
+const token = process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN || process.env.DISCORD_TOKEN || process.env.TOKEN;
 
-// Start Discord Bot with Token from Environment Variable
-let rawToken = process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN || process.env.DISCORD_TOKEN || process.env.TOKEN || '';
-const BOT_TOKEN = rawToken.trim().replace(/^["']|["']$/g, '');
-
-if (!BOT_TOKEN) {
-  console.error('ERROR: DISCORD_BOT_TOKEN environment variable is not set!');
-  console.log('Set DISCORD_BOT_TOKEN in your host environment variables.');
+if (!token) {
+  console.error('❌ DISCORD_BOT_TOKEN environment variable is missing! Please set it in your environment or Secrets tab.');
 } else {
-  client.login(BOT_TOKEN).catch((err) => {
-    console.error('Login error:', err.message);
-    if (err.message.includes('TokenInvalid') || err.code === 'TokenInvalid') {
-      console.error('\n======================================================');
-      console.error('CRITICAL: DISCORD BOT TOKEN IS INVALID OR REVOKED!');
-      console.error('1. If your token was pushed to GitHub, Discord automatically revoked it for security.');
-      console.error('2. Go to https://discord.com/developers/applications');
-      console.error('3. Select your bot -> "Bot" tab -> Click "Reset Token".');
-      console.error('4. Copy the NEW token.');
-      console.error('5. In Render Dashboard -> Environment -> Set DISCORD_BOT_TOKEN to your NEW token.');
-      console.error('======================================================\n');
-    }
+  const cleanToken = token.trim().replace(/^["']|["']$/g, '');
+  client.login(cleanToken).catch(err => {
+    console.error('❌ Failed to login to Discord:', err.message);
   });
 }
