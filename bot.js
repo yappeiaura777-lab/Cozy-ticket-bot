@@ -1,81 +1,112 @@
-require('dotenv').config();
+// Standalone Discord.js Exchange Bot (Cozy Exchange Panel & Ticket System)
+// Ready for 24/7 hosting on Render, Replit, Railway, Discloud, or VPS.
+
+try { require('dotenv').config(); } catch (e) {}
+
 const { 
   Client, 
   GatewayIntentBits, 
   EmbedBuilder, 
   ActionRowBuilder, 
-  ButtonBuilder, 
-  ButtonStyle, 
+  StringSelectMenuBuilder, 
   ModalBuilder, 
   TextInputBuilder, 
-  TextInputStyle,
-  PermissionFlagsBits,
-  AttachmentBuilder
+  TextInputStyle, 
+  ButtonBuilder, 
+  ButtonStyle, 
+  PermissionFlagsBits, 
+  ActivityType, 
+  AttachmentBuilder 
 } = require('discord.js');
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.MessageContent
   ]
 });
 
-// Hardcoded Channel & Role IDs
-const RULES_CHANNEL_ID = '1532014002694131722';
-const TRANSCRIPT_CHANNEL_ID = '1532014023774834889';
-const HISTORY_CHANNEL_ID = '1532014041189498881';
-const FEEDBACK_CHANNEL_ID = '1532013898083831808';
+// Roles & Config Constants
 const EXCHANGER_ROLE_ID = '1532005989879124129';
+const TRANSCRIPT_CHANNEL_ID = '1531286414757593178';
+const HISTORY_CHANNEL_ID = '1531286413289656411';
+const RULES_CHANNEL_ID = '1531286418025091171';
+const FEEDBACK_CHANNEL_ID = '1532423288058417182';
 
-// Exchange Rates & Category Config
-let rates = {
-  i2c: '104 INR = $1.00 USD (9.6% Fee)',
-  c2i: '$1.00 USD = 88 INR (15.38% Fee)',
-  c2c: '5.00% Exchange Fee',
+// In-Memory Storage
+const ticketDataMap = new Map();
+const tempExchangeMap = new Map();
+
+// Default Exchange Rates Configuration
+const rates = {
+  inrToCrypto: 104,
+  cryptoToInrBelow100: 100,
+  cryptoToInrAbove100: 101,
+  cryptoToCryptoFeePercent: 1.5,
+  minAmountDollars: 1,
   categoryIds: {
-    i2c: '1532013809655578704',
-    c2i: '1532013833445539851',
-    c2c: '1532013861274751026'
+    i2c: '1531286400882966589',
+    c2i: '1531286401889599612',
+    c2c: '1531286403734835381'
   }
 };
 
-// In-Memory Storage maps
-const tempExchangeMap = new Map();
-const ticketDataMap = new Map();
-
-// Helper Function: Check if channel is a valid ticket channel
+// Helper: Check if a channel is a valid exchange ticket channel
 function isTicketChannel(channel) {
-  if (!channel) return false;
+  if (!channel || !channel.name) return false;
+
+  // 1. Check in ticketDataMap
   if (ticketDataMap.has(channel.id)) return true;
-  if (channel.parentId && Object.values(rates.categoryIds).includes(channel.parentId)) return true;
-  const name = channel.name || '';
-  return name.startsWith('i2c-') || name.startsWith('c2i-') || name.startsWith('c2c-') || name.startsWith('claimed-') || name.startsWith('unclaimed-');
+  for (const [id, t] of ticketDataMap.entries()) {
+    if (t.channelId === channel.id || (id && channel.name.includes(id))) {
+      return true;
+    }
+  }
+
+  // 2. Check if parent category matches exchange categories
+  if (channel.parentId && Object.values(rates.categoryIds).includes(channel.parentId)) {
+    return true;
+  }
+
+  // 3. Check channel name pattern
+  const name = channel.name.toLowerCase();
+  if (/^(i2c|c2i|c2c|ticket|deal|claimed|unclaimed|claim|done)-/.test(name)) {
+    return true;
+  }
+
+  return false;
 }
 
-// Helper Function: Safe lookup of ticket record
+// Helper: Get ticket data safely from channel
 function getTicketData(channel) {
   if (!channel) return null;
   if (ticketDataMap.has(channel.id)) return ticketDataMap.get(channel.id);
-  for (const [key, val] of ticketDataMap.entries()) {
-    if (val.channelId === channel.id) return val;
+  const name = channel.name || '';
+  for (const [id, t] of ticketDataMap.entries()) {
+    if (t.channelId === channel.id || (id && name.includes(id))) {
+      return t;
+    }
   }
   return null;
 }
 
-client.once('ready', () => {
-  console.log(`✅ Cozy Exchange Bot logged in as ${client.user.tag}`);
+client.on('ready', () => {
+  console.log(`[Cozy Bot] Logged in as ${client.user.tag}!`);
+  client.user.setPresence({
+    activities: [{ name: 'Cozy Exchange Panel', type: ActivityType.Watching }],
+    status: 'online'
+  });
 });
 
-// Handle Commands (!panel, .panel, .vouch, .c, .u, .dn, .done, .close)
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  const lowerContent = message.content.toLowerCase().trim();
+  const content = message.content.trim();
+  const lowerContent = content.toLowerCase();
 
-  // Command: !panel, .panel -> SETUP EXCHANGE PANEL
-  if (lowerContent === '!panel' || lowerContent === '.panel') {
+  // Command: !panel, .panel, !setup, .setup
+  if (['!panel', '.panel', '!setup', '.setup'].includes(lowerContent)) {
     const isStaff = message.member?.roles?.cache?.has(EXCHANGER_ROLE_ID) || 
                     message.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
                     message.member?.permissions?.has(PermissionFlagsBits.ManageGuild);
@@ -83,7 +114,7 @@ client.on('messageCreate', async (message) => {
     if (!isStaff) {
       const errEmbed = new EmbedBuilder()
         .setColor(0xff0000)
-        .setDescription(`❌ **Only members with <@&${EXCHANGER_ROLE_ID}> role can use this command!**`);
+        .setDescription(`❌ **Only staff members with <@&${EXCHANGER_ROLE_ID}> role can run the panel setup command!**`);
       const reply = await message.channel.send({ embeds: [errEmbed] });
       setTimeout(() => {
         reply.delete().catch(() => {});
@@ -92,40 +123,37 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    const panelEmbed = new EmbedBuilder()
+    const embed = new EmbedBuilder()
       .setColor(0x0099ff)
       .setDescription(
-        `<a:green_button:1531292779999662181> **Cozy Exchange Panel**\n\n` +
-        `<a:rizz_tick:1531330187160064030> Welcome to **Cozy Exchange & MM**! Choose an exchange option below to open a ticket.\n\n` +
-        `<a:Arroww:1531292687188234441> **Exchange Rates:**\n` +
-        `• **INR to Crypto (I2C):** ${rates.i2c}\n` +
-        `• **Crypto to INR (C2I):** ${rates.c2i}\n` +
-        `• **Crypto to Crypto (C2C):** ${rates.c2c}\n\n` +
-        `📖 Read our server rules in <#${RULES_CHANNEL_ID}> before starting your trade.`
+        `# Cozy Exchange Panel\n\n` +
+        `Exchange Rates : <a:paisafire:1531292252498956513>\n\n` +
+        `<:paisa:1531292193829028042> **INR TO CRYPTO**\n` +
+        `<a:Arroww:1531292687188234441> Any Amount ${rates.inrToCrypto}/$\n\n` +
+        `<:cryptos:1531293118580658286> **CRYPTO TO INR**\n` +
+        `<a:Arroww:1531292687188234441> Below 100$ : ${rates.cryptoToInrBelow100}/$\n` +
+        `<a:Arroww:1531292687188234441> Above 100$ : ${rates.cryptoToInrAbove100}/$\n\n` +
+        `<a:c2c_exchs:1531292173230673980> **CRYPTO TO CRYPTO**\n` +
+        `<a:Arroww:1531292687188234441> ${rates.cryptoToCryptoFeePercent}% + Transaction Fees\n\n` +
+        `<a:rules_books:1531292929086460034> **RULES**\n` +
+        `<:bluebutton:1531292103882047640> Read Our <#${RULES_CHANNEL_ID}> Before proceeding\n` +
+        `<:bluebutton:1531292103882047640> Fixed Rates No Negotiation\n` +
+        `<:bluebutton:1531292103882047640> Minimum **${rates.minAmountDollars}$**\n` +
+        `<:bluebutton:1531292103882047640> Don't Ping Staff in ticket`
       )
-      .setFooter({ text: 'Cozy Exchange & MM • Instant & Secure' });
+      .setFooter({ text: 'Cozy Exch & MM' });
 
-    const i2cBtn = new ButtonBuilder()
-      .setCustomId('btn_i2c')
-      .setLabel('INR to Crypto')
-      .setEmoji('1531292193829028042')
-      .setStyle(ButtonStyle.Primary);
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId('select_exchange_type')
+      .setPlaceholder('Select exchange type')
+      .addOptions([
+        { label: 'INR TO CRYPTO', value: 'i2c', emoji: { id: '1531292193829028042' } },
+        { label: 'CRYPTO TO INR', value: 'c2i', emoji: { id: '1531293118580658286' } },
+        { label: 'CRYPTO TO CRYPTO', value: 'c2c', emoji: { id: '1531292173230673980' } }
+      ]);
 
-    const c2iBtn = new ButtonBuilder()
-      .setCustomId('btn_c2i')
-      .setLabel('Crypto to INR')
-      .setEmoji('1531293118580658286')
-      .setStyle(ButtonStyle.Success);
-
-    const c2cBtn = new ButtonBuilder()
-      .setCustomId('btn_c2c')
-      .setLabel('Crypto to Crypto')
-      .setEmoji('1531292984132239535')
-      .setStyle(ButtonStyle.Secondary);
-
-    const row = new ActionRowBuilder().addComponents(i2cBtn, c2iBtn, c2cBtn);
-
-    await message.channel.send({ embeds: [panelEmbed], components: [row] });
+    const row = new ActionRowBuilder().addComponents(selectMenu);
+    await message.channel.send({ embeds: [embed], components: [row] });
     return;
   }
 
@@ -405,99 +433,98 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// Handle Interactions (Buttons & Modals)
+// Interactions Handler (Modals, Dropdowns, Buttons)
 client.on('interactionCreate', async (interaction) => {
-  if (interaction.isButton()) {
-    if (['btn_i2c', 'btn_c2i', 'btn_c2c'].includes(interaction.customId)) {
-      // Step 1: Show initial modal with 3 questions
-      if (interaction.customId === 'btn_i2c') {
-        const modal = new ModalBuilder().setCustomId('modal_i2c').setTitle('Initiate INR to Crypto Exchange');
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('sendingApp')
-              .setLabel('sending app name *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. PhonePe, GPay, Paytm, UPI')
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('receivingCrypto')
-              .setLabel('receiving crypto name *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. USDT, LTC, BTC, TRX')
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('dealAmount')
-              .setLabel('Deal Amount *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. 1000 INR or $10 USD')
-              .setRequired(true)
-          )
-        );
-        await interaction.showModal(modal);
-      } else if (interaction.customId === 'btn_c2i') {
-        const modal = new ModalBuilder().setCustomId('modal_c2i').setTitle('Initiate Crypto to INR Exchange');
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('sendingCrypto')
-              .setLabel('sending crypto name *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. USDT, LTC, BTC')
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('receivingWallet')
-              .setLabel('receiving wallet/app name *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. UPI, Bank Transfer, GPay')
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('dealAmount')
-              .setLabel('Deal Amount *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. $50 or 5000 INR')
-              .setRequired(true)
-          )
-        );
-        await interaction.showModal(modal);
-      } else if (interaction.customId === 'btn_c2c') {
-        const modal = new ModalBuilder().setCustomId('modal_c2c').setTitle('Initiate Crypto to Crypto Exchange');
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('sendingCrypto')
-              .setLabel('sending crypto name *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. LTC, USDT')
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('receivingCrypto')
-              .setLabel('receiving crypto name *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. BTC, TRX, SOL')
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('dealAmount')
-              .setLabel('Deal Amount *')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. $50')
-              .setRequired(true)
-          )
-        );
-        await interaction.showModal(modal);
-      }
+  if (interaction.isStringSelectMenu() && interaction.customId === 'select_exchange_type') {
+    const selected = interaction.values[0];
+
+    if (selected === 'i2c') {
+      const modal = new ModalBuilder().setCustomId('modal_i2c').setTitle('Initiate INR to Crypto Exchange');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('sendingApp')
+            .setLabel('sending INR app *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. GPay, PhonePe, Paytm, UPI')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('receivingCrypto')
+            .setLabel('receiving crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT TRC20, BTC, TRX')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. 5000 INR or $50')
+            .setRequired(true)
+        )
+      );
+      await interaction.showModal(modal);
+    } else if (selected === 'c2i') {
+      const modal = new ModalBuilder().setCustomId('modal_c2i').setTitle('Initiate Crypto to INR Exchange');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('sendingCrypto')
+            .setLabel('sending crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT, BTC, TRX')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('receivingWallet')
+            .setLabel('Crypto Wallet Name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. Binance, Trust Wallet, Exodus')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. $50 or 5000 INR')
+            .setRequired(true)
+        )
+      );
+      await interaction.showModal(modal);
+    } else if (selected === 'c2c') {
+      const modal = new ModalBuilder().setCustomId('modal_c2c').setTitle('Initiate Crypto to Crypto Exchange');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('sendingCrypto')
+            .setLabel('sending crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. LTC, USDT')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('receivingCrypto')
+            .setLabel('receiving crypto name *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. BTC, TRX, SOL')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('dealAmount')
+            .setLabel('Deal Amount *')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g. $50')
+            .setRequired(true)
+        )
+      );
+      await interaction.showModal(modal);
     }
   } else if (interaction.isModalSubmit()) {
     if (interaction.customId.startsWith('modal_feedback_')) {
@@ -1038,9 +1065,30 @@ const http = require('http');
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Cozy Exchange Discord Bot is Running 24/7!');
-}).listen(PORT, () => {
-  console.log(`🌐 HTTP Uptime server running on port ${PORT}`);
+  res.end('Cozy Ticket Bot is running 24/7!');
+}).listen(PORT, '0.0.0.0', () => {
+  console.log(`Keep-alive web server listening on port ${PORT}`);
 });
 
-client.login(process.env.DISCORD_BOT_TOKEN);
+// Start Discord Bot with Token from Environment Variable
+let rawToken = process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN || '';
+const BOT_TOKEN = rawToken.trim().replace(/^["']|["']$/g, '');
+
+if (!BOT_TOKEN) {
+  console.error('ERROR: DISCORD_BOT_TOKEN environment variable is not set!');
+  console.log('Set DISCORD_BOT_TOKEN in your host environment variables.');
+} else {
+  client.login(BOT_TOKEN).catch((err) => {
+    console.error('Login error:', err.message);
+    if (err.message.includes('TokenInvalid') || err.code === 'TokenInvalid') {
+      console.error('\n======================================================');
+      console.error('CRITICAL: DISCORD BOT TOKEN IS INVALID OR REVOKED!');
+      console.error('1. If your token was pushed to GitHub, Discord automatically revoked it for security.');
+      console.error('2. Go to https://discord.com/developers/applications');
+      console.error('3. Select your bot -> "Bot" tab -> Click "Reset Token".');
+      console.error('4. Copy the NEW token.');
+      console.error('5. In Render Dashboard -> Environment -> Set DISCORD_BOT_TOKEN to your NEW token.');
+      console.error('======================================================\n');
+    }
+  });
+      }
