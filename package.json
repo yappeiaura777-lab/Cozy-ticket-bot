@@ -1,0 +1,15 @@
+{
+  "name": "cozy-ticket-bot",
+  "version": "1.0.0",
+  "description": "Cozy Exchange & MM Discord Bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
