@@ -1,3 +1,8 @@
+// Standalone Discord.js Exchange Bot (Cozy Exchange Panel & Ticket System)
+// Ready for 24/7 hosting on Render, Replit, Railway, Discloud, or VPS.
+
+try { require('dotenv').config(); } catch (e) {}
+
 const { 
   Client, 
   GatewayIntentBits, 
@@ -27,6 +32,7 @@ const EXCHANGER_ROLE_ID = '1532005989879124129';
 const TRANSCRIPT_CHANNEL_ID = '1531286414757593178';
 const HISTORY_CHANNEL_ID = '1531286413289656411';
 const RULES_CHANNEL_ID = '1531286418025091171';
+const FEEDBACK_CHANNEL_ID = '1532423288058417182';
 
 // In-Memory Storage
 const ticketDataMap = new Map();
@@ -46,6 +52,31 @@ const rates = {
   }
 };
 
+// Helper: Check if a channel is a valid exchange ticket channel
+function isTicketChannel(channel) {
+  if (!channel || !channel.name) return false;
+
+  // 1. Check in ticketDataMap
+  for (const [id, t] of ticketDataMap.entries()) {
+    if (t.channelId === channel.id || (id && channel.name.includes(id))) {
+      return true;
+    }
+  }
+
+  // 2. Check if parent category matches exchange categories
+  if (channel.parentId && Object.values(rates.categoryIds).includes(channel.parentId)) {
+    return true;
+  }
+
+  // 3. Check channel name pattern
+  const name = channel.name.toLowerCase();
+  if (/^(i2c|c2i|c2c|ticket|deal)-/.test(name)) {
+    return true;
+  }
+
+  return false;
+}
+
 client.on('ready', () => {
   console.log(`[Cozy Bot] Logged in as ${client.user.tag}!`);
   client.user.setPresence({
@@ -60,8 +91,21 @@ client.on('messageCreate', async (message) => {
   const content = message.content.trim();
   const lowerContent = content.toLowerCase();
 
-  // Command: !panel
-  if (lowerContent === '!panel') {
+  // Command: !panel, .panel, !setup, .setup
+  if (['!panel', '.panel', '!setup', '.setup'].includes(lowerContent)) {
+    const isStaff = message.member?.roles?.cache?.has(EXCHANGER_ROLE_ID) || 
+                    message.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
+                    message.member?.permissions?.has(PermissionFlagsBits.ManageGuild);
+
+    if (!isStaff) {
+      const reply = await message.channel.send('❌ **Only staff members can run the panel setup command!**');
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
+    }
+
     const embed = new EmbedBuilder()
       .setTitle('Cozy Exchange Panel')
       .setColor(0x0099ff)
@@ -96,8 +140,17 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Command: .vouch
-  if (lowerContent.startsWith('.vouch')) {
+  // Command: .vouch, !vouch
+  if (lowerContent.startsWith('.vouch') || lowerContent.startsWith('!vouch')) {
+    if (!isTicketChannel(message.channel)) {
+      const reply = await message.channel.send('❌ **This command can only be used inside an active ticket channel!**');
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
+    }
+
     const channelName = message.channel.name || '';
     let ticketId = null;
     let data = null;
@@ -155,8 +208,17 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Command: .done
-  if (lowerContent === '.done') {
+  // Command: .done, !done, .close, !close
+  if (['.done', '!done', '.close', '!close'].includes(lowerContent)) {
+    if (!isTicketChannel(message.channel)) {
+      const reply = await message.channel.send('❌ **This command can only be used inside an active ticket channel!**');
+      setTimeout(() => {
+        reply.delete().catch(() => {});
+        message.delete().catch(() => {});
+      }, 5000);
+      return;
+    }
+
     const channelName = message.channel.name || '';
     let foundTicketId = null;
     for (const [id, t] of ticketDataMap.entries()) {
@@ -393,6 +455,29 @@ client.on('interactionCreate', async (interaction) => {
       );
 
       await interaction.showModal(modal);
+    } else if (interaction.customId.startsWith('copy_vouch_')) {
+      const ticketId = interaction.customId.replace('copy_vouch_', '');
+      const data = ticketDataMap.get(ticketId);
+      const exchangerUser = data?.claimedUser ? `<@${data.claimedUser.id}>` : '@staff';
+      const typeStr = data?.type === 'c2i' ? 'CRYPTO TO INR' : data?.type === 'c2c' ? 'CRYPTO TO CRYPTO' : 'INR TO CRYPTO';
+
+      let usdVal = 1.00;
+      if (data?.modalData?.dealAmount) {
+        const amtStr = String(data.modalData.dealAmount);
+        const raw = parseFloat(amtStr.replace(/[^0-9.]/g, ''));
+        if (!isNaN(raw) && raw > 0) {
+          usdVal = data.type === 'i2c' ? (amtStr.includes('$') ? raw : raw / 104) : raw;
+        }
+      }
+      const copyableText = `+rep ${exchangerUser} EXCHANGED ${typeStr} [${usdVal.toFixed(2)}$]`;
+      await interaction.reply({
+        content: `\`\`\`${copyableText}\`\`\``,
+        ephemeral: true
+      });
+    } else if (interaction.customId.startsWith('ticket_req_mm_')) {
+      await interaction.reply({
+        content: `<a:rizz_tick:1531330187160064030> **Middleman Requested!** Pinged <@&${EXCHANGER_ROLE_ID}>.`
+      });
     } else if (interaction.customId.startsWith('ticket_claim_')) {
       const ticketId = interaction.customId.replace('ticket_claim_', '');
       const data = ticketDataMap.get(ticketId);
@@ -446,12 +531,35 @@ async function sendTranscript(ticketId, actor, channelObj) {
   } catch (e) {}
 }
 
-// Start Discord Bot with Token from Environment Variable or Hardcoded
-const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN;
+// Simple HTTP Health Check Server for Render / Railway 24/7 hosting
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Cozy Ticket Bot is running 24/7!');
+}).listen(PORT, () => {
+  console.log(`Keep-alive web server listening on port ${PORT}`);
+});
+
+// Start Discord Bot with Token from Environment Variable
+let rawToken = process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN || '';
+const BOT_TOKEN = rawToken.trim().replace(/^["']|["']$/g, '');
 
 if (!BOT_TOKEN) {
   console.error('ERROR: DISCORD_BOT_TOKEN environment variable is not set!');
   console.log('Set DISCORD_BOT_TOKEN in your host environment variables.');
 } else {
-  client.login(BOT_TOKEN);
-      }
+  client.login(BOT_TOKEN).catch((err) => {
+    console.error('Login error:', err.message);
+    if (err.message.includes('TokenInvalid') || err.code === 'TokenInvalid') {
+      console.error('\n======================================================');
+      console.error('CRITICAL: DISCORD BOT TOKEN IS INVALID OR REVOKED!');
+      console.error('1. If your token was pushed to GitHub, Discord automatically revoked it for security.');
+      console.error('2. Go to https://discord.com/developers/applications');
+      console.error('3. Select your bot -> "Bot" tab -> Click "Reset Token".');
+      console.error('4. Copy the NEW token.');
+      console.error('5. In Render Dashboard -> Environment -> Set DISCORD_BOT_TOKEN to your NEW token.');
+      console.error('======================================================\n');
+    }
+  });
+                                              }
